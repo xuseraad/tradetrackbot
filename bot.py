@@ -214,12 +214,10 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
     ], value_input_option="USER_ENTERED")
 
     # ── Kar-Zarar (pozisyon havuzu) ───────────────────────────────────────────
-    # Kural: Her işlem tek satırda temsil edilir. Kısmi satışta:
-    #   - Mevcut AÇIK satırın miktarı/tutarı/komisyonu güncellenir (azaltılır)
-    #   - Satışa ait K/Z bilgileri ayrı yeni satır olarak eklenir
-    # Böylece sheet'te hiçbir zaman "boş" ara satır oluşmaz.
+    # Kural: eşleşme = kaynak satırı sil + yeni satır(lar) sona ekle.
+    # Böylece update/cache tutarsızlığı ve "eski satır kalma" sorunu olmaz.
     kz_ws    = get_or_create_kz_ws(sh)
-    all_rows = kz_ws.get_all_values()
+    all_rows = kz_ws.get_all_values()   # [header, row1, row2, ...]
 
     if not token:
         return is_buy, is_sell
@@ -232,22 +230,41 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
             r[C["DURUM"]]         == status
         )
 
-    def col_letter(idx):
-        """0-tabanlı sütun index → A, B, ... Z, AA, ..."""
-        result = ""
-        idx += 1
-        while idx:
-            idx, rem = divmod(idx - 1, 26)
-            result = chr(65 + rem) + result
-        return result
-
-    LAST_COL = col_letter(len(KZ_HEADERS) - 1)  # "O" (15 sütun)
-
     def calc_pnl(buy_amt, buy_fee, sell_amt, sell_fee):
         brut = round(sell_amt - buy_amt, 4)
         pct  = round((brut / buy_amt * 100) if buy_amt else 0.0, 2)
         net  = round(brut - buy_fee - sell_fee, 4)
         return brut, pct, net, ("KAR ✅" if net > 0 else "ZARAR ❌")
+
+    def closed_row(buy_date, buy_price, buy_qty, buy_amt, buy_fee,
+                   sell_date, sell_price, sell_amt, sell_fee, brut, pct, net, status):
+        return [
+            token, para_birimi,
+            buy_date, sell_date, buy_qty,
+            buy_price, sell_price,
+            buy_fee, sell_fee,
+            buy_amt, sell_amt,
+            brut, pct, net, status,
+        ]
+
+    def open_row(buy_date, buy_price, buy_qty, buy_amt, buy_fee):
+        return [
+            token, para_birimi,
+            buy_date, "",
+            buy_qty, buy_price, "",
+            buy_fee, "",
+            buy_amt, "", "", "", "", STATUS_ACIK,
+        ]
+
+    def unmatched_row(sell_date, sell_price, sell_qty, sell_amt, sell_fee):
+        # SATIŞ bilgileri SATIŞ sütunlarında, ALIŞ sütunları boş
+        return [
+            token, para_birimi,
+            "", sell_date,
+            sell_qty, "", sell_price,
+            "", sell_fee,
+            "", sell_amt, "", "", "", UNMATCHED,
+        ]
 
     # ── ALIŞ ─────────────────────────────────────────────────────────────────
     if is_buy:
@@ -256,7 +273,7 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
         buy_price  = _num(data.get("gerceklesen_fiyat") or data.get("limit_fiyat"))
         buy_fee    = komisyon_val
 
-        # Bekleyen satış var mı?
+        # İlk UNMATCHED satışı bul (FIFO)
         pending = next(
             ((i + 1, r) for i, r in enumerate(all_rows[1:], start=1) if row_matches(r, UNMATCHED)),
             None
@@ -264,63 +281,49 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
 
         if pending:
             ps_idx, ps_row = pending
-            sheet_row  = ps_idx + 1
-            sell_qty   = _num(ps_row[C["ALIŞ MİKTAR"]])   # UNMATCHED satırda miktar ALIŞ MİKTAR'da saklanır
-            sell_amt   = _num(ps_row[C["ALIŞ TUTAR"]])
-            sell_fee   = _num(ps_row[C["ALIŞ KOM"]])
-            sell_price = _num(ps_row[C["ALIŞ FİYAT"]])
-            sell_date  = ps_row[C["ALIŞ TARİHİ"]]
+            sheet_row  = ps_idx + 1   # gspread 1-based
 
-            matched   = min(buy_qty, sell_qty)
-            b_ratio   = matched / buy_qty  if buy_qty  > 0 else 1.0
-            s_ratio   = matched / sell_qty if sell_qty > 0 else 1.0
-            used_b_amt = round(buy_amount * b_ratio, 4)
-            used_b_fee = round(buy_fee    * b_ratio, 4)
-            used_s_amt = round(sell_amt   * s_ratio, 4)
-            used_s_fee = round(sell_fee   * s_ratio, 4)
-            brut, pct, net, status = calc_pnl(used_b_amt, used_b_fee, used_s_amt, used_s_fee)
+            sell_qty_p   = _num(ps_row[C["ALIŞ MİKTAR"]])   # unmatched_row'da qty ALIŞ MİKTAR'da
+            sell_amt_p   = _num(ps_row[C["SATIŞ TUTAR"]])
+            sell_fee_p   = _num(ps_row[C["SATIŞ KOM"]])
+            sell_price_p = _num(ps_row[C["SATIŞ FİYAT"]])
+            sell_date_p  = ps_row[C["SATIŞ TARİHİ"]]
+            matched    = min(buy_qty, sell_qty_p)
+            b_ratio    = matched / buy_qty    if buy_qty    > 0 else 1.0
+            s_ratio    = matched / sell_qty_p if sell_qty_p > 0 else 1.0
+            u_b_amt    = round(buy_amount  * b_ratio, 4)
+            u_b_fee    = round(buy_fee     * b_ratio, 4)
+            u_s_amt    = round(sell_amt_p  * s_ratio, 4)
+            u_s_fee    = round(sell_fee_p  * s_ratio, 4)
+            brut, pct, net, status = calc_pnl(u_b_amt, u_b_fee, u_s_amt, u_s_fee)
 
-            # Mevcut UNMATCHED satırı → kapalı K/Z satırına dönüştür
-            kz_ws.update(
-                f"A{sheet_row}:{LAST_COL}{sheet_row}",
-                [[
-                    token, para_birimi,
-                    gerceklesme_raw,          # ALIŞ TARİHİ
-                    sell_date,                # SATIŞ TARİHİ
-                    matched,                  # ALIŞ MİKTAR
-                    buy_price,                # ALIŞ FİYAT
-                    sell_price,               # SATIŞ FİYAT
-                    used_b_fee,               # ALIŞ KOM
-                    used_s_fee,               # SATIŞ KOM
-                    used_b_amt,               # ALIŞ TUTAR
-                    used_s_amt,               # SATIŞ TUTAR
-                    brut, pct, net, status,
-                ]],
+            # Kaynak UNMATCHED satırı sil
+            kz_ws.delete_rows(sheet_row)
+
+            # Kapalı satır ekle
+            kz_ws.append_row(
+                closed_row(gerceklesme_raw, buy_price, matched, u_b_amt, u_b_fee,
+                           sell_date_p, sell_price_p, u_s_amt, u_s_fee,
+                           brut, pct, net, status),
                 value_input_option="USER_ENTERED",
             )
 
             # Alıştan kalan → yeni AÇIK
             leftover_qty = round(buy_qty - matched, 8)
             if leftover_qty > 0.000001:
-                lb_amt = round(buy_amount - used_b_amt, 4)
-                lb_fee = round(buy_fee    - used_b_fee, 4)
-                kz_ws.append_row([
-                    token, para_birimi,
-                    gerceklesme_raw, "",       # ALIŞ TARİHİ, SATIŞ TARİHİ
-                    leftover_qty, buy_price, "",
-                    lb_fee, "",
-                    lb_amt, "", "", "", "", STATUS_ACIK,
-                ], value_input_option="USER_ENTERED")
-
+                kz_ws.append_row(
+                    open_row(gerceklesme_raw, buy_price,
+                             leftover_qty,
+                             round(buy_amount - u_b_amt, 4),
+                             round(buy_fee    - u_b_fee, 4)),
+                    value_input_option="USER_ENTERED",
+                )
         else:
             # Bekleyen satış yok → yeni AÇIK
-            kz_ws.append_row([
-                token, para_birimi,
-                gerceklesme_raw, "",           # ALIŞ TARİHİ, SATIŞ TARİHİ
-                buy_qty, buy_price, "",
-                buy_fee, "",
-                buy_amount, "", "", "", "", STATUS_ACIK,
-            ], value_input_option="USER_ENTERED")
+            kz_ws.append_row(
+                open_row(gerceklesme_raw, buy_price, buy_qty, buy_amount, buy_fee),
+                value_input_option="USER_ENTERED",
+            )
 
     # ── SATIŞ ────────────────────────────────────────────────────────────────
     elif is_sell:
@@ -337,101 +340,82 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
         ]
 
         if not open_buys:
-            # Açık alış yok → UNMATCHED (miktar/tutar/kom ALIŞ sütunlarında sakla, SATIŞ TARİHİ'ne tarih)
-            kz_ws.append_row([
-                token, para_birimi,
-                "", gerceklesme_raw,           # ALIŞ TARİHİ boş, SATIŞ TARİHİ dolu
-                sell_qty, "", sell_price,
-                "", sell_fee,
-                "", sell_amount, "", "", "", UNMATCHED,
-            ], value_input_option="USER_ENTERED")
+            kz_ws.append_row(
+                unmatched_row(gerceklesme_raw, sell_price, sell_qty, sell_amount, sell_fee),
+                value_input_option="USER_ENTERED",
+            )
             return is_buy, is_sell
 
-        # FIFO: sırayla AÇIK alışları tüket
         remaining_sell     = sell_qty
         remaining_sell_amt = sell_amount
+        # Satış işlenirken silinen satırlar sheet_row index'ini kaydırır.
+        # Bunu önlemek için büyükten küçüğe değil, sırayla işleyip
+        # her silmede offset takip ediyoruz.
+        deleted_count = 0
 
         for buy_idx, buy_row in open_buys:
             if remaining_sell <= 0.000001:
                 break
 
-            sheet_row  = buy_idx + 1
-            avail_qty  = _num(buy_row[C["ALIŞ MİKTAR"]])
-            avail_amt  = _num(buy_row[C["ALIŞ TUTAR"]])
-            avail_fee  = _num(buy_row[C["ALIŞ KOM"]])
+            # Her silmede önceki satırlar yukarı kayar
+            sheet_row   = buy_idx + 1 - deleted_count
+            avail_qty   = _num(buy_row[C["ALIŞ MİKTAR"]])
+            avail_amt   = _num(buy_row[C["ALIŞ TUTAR"]])
+            avail_fee   = _num(buy_row[C["ALIŞ KOM"]])
             buy_price_r = _num(buy_row[C["ALIŞ FİYAT"]])
             buy_date    = buy_row[C["ALIŞ TARİHİ"]]
 
             if avail_qty <= 0:
                 continue
 
-            matched   = min(remaining_sell, avail_qty)
-            b_ratio   = matched / avail_qty
-            s_ratio   = matched / sell_qty if sell_qty > 0 else 1.0
+            matched  = min(remaining_sell, avail_qty)
+            b_ratio  = matched / avail_qty
+            s_ratio  = matched / sell_qty if sell_qty > 0 else 1.0
 
-            used_b_amt = round(avail_amt * b_ratio, 4)
-            used_b_fee = round(avail_fee * b_ratio, 4)
-            used_s_amt = round(sell_amount * s_ratio, 4)
-            used_s_fee = round(sell_fee    * s_ratio, 4)
-            brut, pct, net, status = calc_pnl(used_b_amt, used_b_fee, used_s_amt, used_s_fee)
+            u_b_amt  = round(avail_amt  * b_ratio, 4)
+            u_b_fee  = round(avail_fee  * b_ratio, 4)
+            u_s_amt  = round(sell_amount * s_ratio, 4)
+            u_s_fee  = round(sell_fee    * s_ratio, 4)
+            brut, pct, net, status = calc_pnl(u_b_amt, u_b_fee, u_s_amt, u_s_fee)
 
-            is_full_match = abs(matched - avail_qty) < 0.000001
+            # Her durumda kaynak AÇIK satırı sil
+            kz_ws.delete_rows(sheet_row)
+            deleted_count += 1
 
-            if is_full_match:
-                # Tam eşleşme: mevcut AÇIK satırı kapat
-                kz_ws.update(
-                    f"A{sheet_row}:{LAST_COL}{sheet_row}",
-                    [[
-                        token, para_birimi,
-                        buy_date, gerceklesme_raw,
-                        matched, buy_price_r, sell_price,
-                        used_b_fee, used_s_fee,
-                        used_b_amt, used_s_amt,
-                        brut, pct, net, status,
-                    ]],
+            # Kapalı satır ekle
+            kz_ws.append_row(
+                closed_row(buy_date, buy_price_r, matched, u_b_amt, u_b_fee,
+                           gerceklesme_raw, sell_price, u_s_amt, u_s_fee,
+                           brut, pct, net, status),
+                value_input_option="USER_ENTERED",
+            )
+
+            # Kısmi eşleşme: alıştan kalan → yeni AÇIK
+            leftover_qty = round(avail_qty - matched, 8)
+            if leftover_qty > 0.000001:
+                kz_ws.append_row(
+                    open_row(buy_date, buy_price_r,
+                             leftover_qty,
+                             round(avail_amt - u_b_amt, 4),
+                             round(avail_fee - u_b_fee, 4)),
                     value_input_option="USER_ENTERED",
                 )
-            else:
-                # Kısmi eşleşme:
-                # 1) Mevcut AÇIK satırı kalan miktarla güncelle (yerinde)
-                leftover_qty = round(avail_qty - matched, 8)
-                leftover_amt = round(avail_amt - used_b_amt, 4)
-                leftover_fee = round(avail_fee - used_b_fee, 4)
-                kz_ws.update(
-                    f"A{sheet_row}:{LAST_COL}{sheet_row}",
-                    [[
-                        token, para_birimi,
-                        buy_date, "",
-                        leftover_qty, buy_price_r, "",
-                        leftover_fee, "",
-                        leftover_amt, "", "", "", "", STATUS_ACIK,
-                    ]],
-                    value_input_option="USER_ENTERED",
-                )
-                # 2) Kapatılan kısım → yeni satır olarak ekle (boşluk yok, sona eklenir)
-                kz_ws.append_row([
-                    token, para_birimi,
-                    buy_date, gerceklesme_raw,
-                    matched, buy_price_r, sell_price,
-                    used_b_fee, used_s_fee,
-                    used_b_amt, used_s_amt,
-                    brut, pct, net, status,
-                ], value_input_option="USER_ENTERED")
+                # Kalan alış yeni satır olarak eklendi, bir sonraki döngüde bu satırı işlemeyeceğiz
+                # çünkü open_buys listesi başta snapshot alındı — sorun yok.
 
             remaining_sell     -= matched
-            remaining_sell_amt -= used_s_amt
+            remaining_sell_amt -= u_s_amt
 
         # Satıştan hâlâ kalan → UNMATCHED
         if remaining_sell > 0.000001:
             s_ratio   = remaining_sell / sell_qty if sell_qty > 0 else 1.0
-            rem_s_fee = round(sell_fee * s_ratio, 4)
-            kz_ws.append_row([
-                token, para_birimi,
-                "", gerceklesme_raw,
-                remaining_sell, "", sell_price,
-                "", rem_s_fee,
-                "", round(remaining_sell_amt, 4), "", "", "", UNMATCHED,
-            ], value_input_option="USER_ENTERED")
+            kz_ws.append_row(
+                unmatched_row(gerceklesme_raw, sell_price,
+                              round(remaining_sell, 8),
+                              round(remaining_sell_amt, 4),
+                              round(sell_fee * s_ratio, 4)),
+                value_input_option="USER_ENTERED",
+            )
 
     return is_buy, is_sell
 
