@@ -107,33 +107,40 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
     try:
         ws = sh.worksheet("İşlem Kayıtları")
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet("İşlem Kayıtları", rows=1000, cols=20)
+        ws = sh.add_worksheet("İşlem Kayıtları", rows=1000, cols=10)
         ws.append_row([
-            "PLATFORM", "İŞLEM ÇİFTİ", "PARA BİRİMİ", "EMİR TİPİ", "DURUM",
-            "EMİR TARİHİ", "GERÇEKLEŞME TARİHİ",
-            "GİRİLEN ADET", "LİMİT FİYAT",
-            "GERÇEKLEŞEN MİKTAR (TOKEN)", "GERÇEKLEŞEN FİYAT",
-            "GERÇEKLEŞEN TUTAR", "KOMİSYON", "TOPLAM", "NOT",
+            "Gerçekleşme Tarihi", "Gerçekleşme Saati",
+            "Emir Tipi", "Ürün",
+            "Token Adet", "Fiyat Maliyet", "Maliyet Birim",
+            "Komisyon", "Gerçekleşen Tutar", "Gerçekleşen Tutar Birim",
         ])
 
-    fiyat_label = f"FİYAT ({para_birimi})"  # noqa: F841  (for future column rename use)
+    # Tarih ve saati böl: "5 Mayıs 2026, 21:44:26" → ("5 Mayıs 2026", "21:44:26")
+    gerceklesme_raw = data.get("gerceklesme_tarihi") or data.get("emir_tarihi") or ""
+    if "," in gerceklesme_raw:
+        tarih_part, saat_part = [x.strip() for x in gerceklesme_raw.split(",", 1)]
+    else:
+        tarih_part = gerceklesme_raw
+        saat_part  = ""
+
+    # Komisyon: sayısal değer varsa sayıyı yaz, metin (örn. "Ücretsiz") veya null ise 0 yaz
+    komisyon_raw = data.get("komisyon")
+    try:
+        komisyon_val = float(str(komisyon_raw).replace(",", ".").strip()) if komisyon_raw is not None else 0
+    except (ValueError, TypeError):
+        komisyon_val = 0
 
     row = [
-        data.get("platform")                  or "",
-        data.get("islem_cifti")               or "",
-        para_birimi,
+        tarih_part,
+        saat_part,
         emir_tipi,
-        data.get("durum")                     or "",
-        data.get("emir_tarihi")               or "",
-        data.get("gerceklesme_tarihi")        or "",
-        data.get("girilen_adet")              or "",
-        data.get("limit_fiyat")               or "",
-        data.get("gerceklesen_miktar_token")  or "",
-        data.get("gerceklesen_fiyat")         or "",
-        data.get("gerceklesen_tutar")         or "",
-        data.get("komisyon")                  or "",
-        data.get("toplam")                    or "",
-        f"Bot · {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        data.get("token") or "",
+        data.get("gerceklesen_miktar_token") or "",
+        data.get("gerceklesen_fiyat") or data.get("limit_fiyat") or "",
+        para_birimi,
+        komisyon_val,
+        data.get("gerceklesen_tutar") or "",
+        para_birimi,
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
 
