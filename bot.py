@@ -124,10 +124,20 @@ def safe_komisyon(raw) -> float:
 
 
 # ─── Claude vision ───────────────────────────────────────────────────────────
+def _detect_image_type(data: bytes) -> str:
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    if data[:3] == b'\xff\xd8\xff':
+        return "image/jpeg"
+    if data[:6] in (b'GIF87a', b'GIF89a'):
+        return "image/gif"
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return "image/webp"
+    return "image/jpeg"
+
+
 def extract_trade_data(image_bytes: bytes) -> dict:
-    import imghdr
-    detected = imghdr.what(None, h=image_bytes)
-    media_type = f"image/{detected}" if detected else "image/jpeg"
+    media_type = _detect_image_type(image_bytes)
     b64 = base64.standard_b64encode(image_bytes).decode()
     msg = claude.messages.create(
         model="claude-sonnet-4-6",
