@@ -326,15 +326,16 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
             )
 
     # ── SATIŞ ────────────────────────────────────────────────────────────────
-    elif is_sell:
+   
+elif is_sell:
         sell_qty    = _num(data.get("gerceklesen_miktar_token"))
         sell_amount = _num(data.get("gerceklesen_tutar"))
         sell_price  = _num(data.get("gerceklesen_fiyat") or data.get("limit_fiyat"))
         sell_fee    = komisyon_val
 
-        # AÇIK alışları FIFO sırasıyla bul
+        # AÇIK alışları FIFO sırasıyla bul (Döngüde satır silmek yerine indeksleri ve satır numaralarını güncel tutacağız)
         open_buys = [
-            (i + 1, r)
+            {"row_num": i + 1, "data": r}
             for i, r in enumerate(all_rows[1:], start=1)
             if row_matches(r, STATUS_ACIK)
         ]
@@ -348,17 +349,16 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
 
         remaining_sell     = sell_qty
         remaining_sell_amt = sell_amount
-        # Satış işlenirken silinen satırlar sheet_row index'ini kaydırır.
-        # Bunu önlemek için büyükten küçüğe değil, sırayla işleyip
-        # her silmede offset takip ediyoruz.
-        deleted_count = 0
+        deleted_count = 0  # Silinen satır sayısını tutarak aşağıdaki satırların yukarı kaymasını hesaplıyoruz
 
-        for buy_idx, buy_row in open_buys:
+        for buy_item in open_buys:
             if remaining_sell <= 0.000001:
                 break
 
-            # Her silmede önceki satırlar yukarı kayar
-            sheet_row   = buy_idx + 1 - deleted_count
+            buy_row = buy_item["data"]
+            # Her silinen satır sonrası alttaki satırlar 1 yukarı kayar:
+            sheet_row = buy_item["row_num"] - deleted_count
+
             avail_qty   = _num(buy_row[C["ALIŞ MİKTAR"]])
             avail_amt   = _num(buy_row[C["ALIŞ TUTAR"]])
             avail_fee   = _num(buy_row[C["ALIŞ KOM"]])
@@ -378,11 +378,11 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
             u_s_fee  = round(sell_fee    * s_ratio, 4)
             brut, pct, net, status = calc_pnl(u_b_amt, u_b_fee, u_s_amt, u_s_fee)
 
-            # Her durumda kaynak AÇIK satırı sil
+            # 1) Eski AÇIK satırı tablodan KESİN olarak sildiriyoruz
             kz_ws.delete_rows(sheet_row)
             deleted_count += 1
 
-            # Kapalı satır ekle
+            # 2) Yeni kapanan KAR/ZARAR satırını tablonun en altına ekliyoruz
             kz_ws.append_row(
                 closed_row(buy_date, buy_price_r, matched, u_b_amt, u_b_fee,
                            gerceklesme_raw, sell_price, u_s_amt, u_s_fee,
@@ -390,7 +390,7 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
                 value_input_option="USER_ENTERED",
             )
 
-            # Kısmi eşleşme: alıştan kalan → yeni AÇIK
+            # Kısmi eşleşme: Eğer alış miktarı satıştan fazlaysa, kalan miktar için yeni bir AÇIK satır açıyoruz
             leftover_qty = round(avail_qty - matched, 8)
             if leftover_qty > 0.000001:
                 kz_ws.append_row(
@@ -400,13 +400,11 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
                              round(avail_fee - u_b_fee, 4)),
                     value_input_option="USER_ENTERED",
                 )
-                # Kalan alış yeni satır olarak eklendi, bir sonraki döngüde bu satırı işlemeyeceğiz
-                # çünkü open_buys listesi başta snapshot alındı — sorun yok.
 
             remaining_sell     -= matched
             remaining_sell_amt -= u_s_amt
 
-        # Satıştan hâlâ kalan → UNMATCHED
+        # Satıştan hâlâ kalan miktar varsa → UNMATCHED olarak ekle
         if remaining_sell > 0.000001:
             s_ratio   = remaining_sell / sell_qty if sell_qty > 0 else 1.0
             kz_ws.append_row(
