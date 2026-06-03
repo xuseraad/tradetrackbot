@@ -157,62 +157,100 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
         ])
         # Col indices (0-based): TOKEN=0, PARA_BIRIMI=1, ... DURUM=15
 
+    all_rows = pnl_ws.get_all_values()
+    headers  = all_rows[0] if all_rows else []
+
+    def col(name):
+        try:
+            return headers.index(name)
+        except ValueError:
+            return None
+
+    TOKEN_COL  = col("TOKEN")        or 0
+    PB_COL     = col("PARA BİRİMİ") or 1
+    STATUS_COL = col("DURUM")        or 15
+
+    def find_row(status_value):
+        """FIFO: token + para birimi + status eşleşen ilk satırın index'i (all_rows içinde)."""
+        for i, r in enumerate(all_rows[1:], start=1):
+            if (len(r) > TOKEN_COL  and r[TOKEN_COL]  == token and
+                len(r) > PB_COL    and r[PB_COL]    == para_birimi and
+                len(r) > STATUS_COL and r[STATUS_COL] == status_value):
+                return i
+        return None
+
+    def do_match(buy_row, sell_data, sheet_pnl_ws):
+        """Alış satırına satış bilgilerini yaz, K/Z hesapla."""
+        sell_price  = _num(sell_data.get("gerceklesen_fiyat") or sell_data.get("limit_fiyat"))
+        sell_qty    = _num(sell_data.get("gerceklesen_miktar_token"))
+        sell_amount = _num(sell_data.get("gerceklesen_tutar"))
+        sell_fee    = _num(sell_data.get("komisyon"))
+        buy_amount  = _num(buy_row[5]) if len(buy_row) > 5 else 0.0
+        buy_fee     = _num(buy_row[6]) if len(buy_row) > 6 else 0.0
+        brut_pnl    = sell_amount - buy_amount
+        pct         = (brut_pnl / buy_amount * 100) if buy_amount else 0.0
+        net_pnl     = brut_pnl - buy_fee - sell_fee
+        status      = "KAR ✅" if net_pnl > 0 else "ZARAR ❌"
+        return sell_price, sell_qty, sell_amount, sell_fee, brut_pnl, pct, net_pnl, status
+
     if is_buy:
-        pnl_ws.append_row([
-            token,
-            para_birimi,
-            data.get("gerceklesme_tarihi") or data.get("emir_tarihi") or "",
-            data.get("gerceklesen_fiyat")  or data.get("limit_fiyat") or "",
-            data.get("gerceklesen_miktar_token") or "",
-            data.get("gerceklesen_tutar") or "",
-            data.get("komisyon") or "",
-            "", "", "", "", "",   # satış alanları boş
-            "", "", "",
-            "AÇIK",
-        ], value_input_option="USER_ENTERED")
+        # Önce bekleyen satış var mı bak (EŞLEŞMEDİ)
+        pending_sell_idx = find_row("EŞLeŞMEDİ ⚠️")
+        if pending_sell_idx is not None:
+            # Bekleyen satışla eşleştir: alış bilgilerini o satıra yaz
+            sell_row   = all_rows[pending_sell_idx]
+            sheet_row  = pending_sell_idx + 1
+            buy_amount = _num(data.get("gerceklesen_tutar"))
+            buy_fee    = _num(data.get("komisyon"))
+            sell_amount = _num(sell_row[10]) if len(sell_row) > 10 else 0.0
+            sell_fee    = _num(sell_row[11]) if len(sell_row) > 11 else 0.0
+            brut_pnl    = sell_amount - buy_amount
+            pct         = (brut_pnl / buy_amount * 100) if buy_amount else 0.0
+            net_pnl     = brut_pnl - buy_fee - sell_fee
+            status      = "KAR ✅" if net_pnl > 0 else "ZARAR ❌"
+            # Alış bilgilerini A:G sütunlarına yaz, K/Z hesapla, durumu güncelle
+            pnl_ws.update(
+                f"A{sheet_row}:P{sheet_row}",
+                [[
+                    token, para_birimi,
+                    data.get("gerceklesme_tarihi") or data.get("emir_tarihi") or "",
+                    data.get("gerceklesen_fiyat") or data.get("limit_fiyat") or "",
+                    data.get("gerceklesen_miktar_token") or "",
+                    data.get("gerceklesen_tutar") or "",
+                    data.get("komisyon") or "",
+                    sell_row[7]  if len(sell_row) > 7  else "",
+                    sell_row[8]  if len(sell_row) > 8  else "",
+                    sell_row[9]  if len(sell_row) > 9  else "",
+                    sell_row[10] if len(sell_row) > 10 else "",
+                    sell_row[11] if len(sell_row) > 11 else "",
+                    round(brut_pnl, 4),
+                    round(pct, 2),
+                    round(net_pnl, 4),
+                    status,
+                ]],
+                value_input_option="USER_ENTERED",
+            )
+        else:
+            # Bekleyen satış yok — AÇIK olarak ekle
+            pnl_ws.append_row([
+                token, para_birimi,
+                data.get("gerceklesme_tarihi") or data.get("emir_tarihi") or "",
+                data.get("gerceklesen_fiyat")  or data.get("limit_fiyat") or "",
+                data.get("gerceklesen_miktar_token") or "",
+                data.get("gerceklesen_tutar") or "",
+                data.get("komisyon") or "",
+                "", "", "", "", "",
+                "", "", "",
+                "AÇIK",
+            ], value_input_option="USER_ENTERED")
 
     elif is_sell and token:
-        all_rows = pnl_ws.get_all_values()
-        headers  = all_rows[0] if all_rows else []
-
-        # Sütun index tespiti (başlık satırından) — sabit index yerine dinamik
-        def col(name):
-            try:
-                return headers.index(name)
-            except ValueError:
-                return None
-
-        TOKEN_COL   = col("TOKEN")         # 0
-        PB_COL      = col("PARA BİRİMİ")  # 1
-        STATUS_COL  = col("DURUM")        # 15
-
-        matched_row_idx = None  # data satır index'i (all_rows içinde, 0-based)
-        for i, r in enumerate(all_rows[1:], start=1):   # i=1 → data row 2 in sheet
-            # FIFO: aynı token + aynı para birimi + AÇIK olan en eski satır
-            token_match = TOKEN_COL is not None and len(r) > TOKEN_COL and r[TOKEN_COL] == token
-            pb_match    = PB_COL    is not None and len(r) > PB_COL    and r[PB_COL] == para_birimi
-            status_open = STATUS_COL is not None and len(r) > STATUS_COL and r[STATUS_COL] == "AÇIK"
-            if token_match and pb_match and status_open:
-                matched_row_idx = i
-                break   # FIFO: ilk (en eski) eşleşme
-
-        if matched_row_idx is not None:
-            r = all_rows[matched_row_idx]
-
-            sell_price  = _num(data.get("gerceklesen_fiyat") or data.get("limit_fiyat"))
-            sell_qty    = _num(data.get("gerceklesen_miktar_token"))
-            sell_amount = _num(data.get("gerceklesen_tutar"))
-            sell_fee    = _num(data.get("komisyon"))
-
-            buy_amount  = _num(r[5]) if len(r) > 5 else 0.0  # ALIŞ TUTAR
-            buy_fee     = _num(r[6]) if len(r) > 6 else 0.0  # ALIŞ KOM
-
-            brut_pnl = sell_amount - buy_amount
-            pct      = (brut_pnl / buy_amount * 100) if buy_amount else 0.0
-            net_pnl  = brut_pnl - buy_fee - sell_fee
-            status   = "KAR ✅" if net_pnl > 0 else "ZARAR ❌"
-
-            sheet_row = matched_row_idx + 1  # gspread 1-based
+        # AÇIK alış var mı bak
+        open_buy_idx = find_row("AÇIK")
+        if open_buy_idx is not None:
+            buy_row = all_rows[open_buy_idx]
+            sheet_row = open_buy_idx + 1
+            sell_price, sell_qty, sell_amount, sell_fee, brut_pnl, pct, net_pnl, status = do_match(buy_row, data, pnl_ws)
             pnl_ws.update(
                 f"H{sheet_row}:P{sheet_row}",
                 [[
@@ -226,17 +264,17 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
                 value_input_option="USER_ENTERED",
             )
         else:
-            # Eşleşen alış bulunamadı — yine de Kar-Zarar'a yaz, ALIŞ alanları boş
+            # AÇIK alış yok — bekleyen satış olarak ekle
             pnl_ws.append_row([
                 token, para_birimi,
-                "", "", "", "", "",  # alış alanları boş
+                "", "", "", "", "",
                 data.get("gerceklesme_tarihi") or data.get("emir_tarihi") or "",
                 data.get("gerceklesen_fiyat") or "",
                 data.get("gerceklesen_miktar_token") or "",
                 data.get("gerceklesen_tutar") or "",
                 data.get("komisyon") or "",
                 "", "", "",
-                "EŞLEŞMEDİ ⚠️",
+                "EŞLeŞMEDİ ⚠️",
             ], value_input_option="USER_ENTERED")
 
     return is_buy, is_sell
