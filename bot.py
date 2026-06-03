@@ -4,6 +4,7 @@ import base64
 import logging
 import anthropic
 import gspread
+import asyncio
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from google.oauth2.service_account import Credentials
@@ -55,7 +56,6 @@ Sadece JSON döndür, başka hiçbir şey yazma."""
 UNMATCHED   = "EŞLEŞMEDİ ⚠️"
 STATUS_ACIK = "AÇIK"
 
-# Sütun sırası — görseldeki düzene göre
 KZ_HEADERS = [
     "TOKEN", "PARA BİRİMİ",
     "ALIŞ TARİHİ", "SATIŞ TARİHİ", "ALIŞ MİKTAR",
@@ -64,7 +64,6 @@ KZ_HEADERS = [
 ]
 C = {h: i for i, h in enumerate(KZ_HEADERS)}
 
-# ─── Google Sheets client (önbellekli) ───────────────────────────────────────
 _gc = None
 
 def sheets_client():
@@ -79,7 +78,6 @@ def sheets_client():
         _gc = gspread.authorize(creds)
     return _gc
 
-
 # ─── Yardımcılar ─────────────────────────────────────────────────────────────
 def _num(val) -> float:
     if val is None:
@@ -89,10 +87,8 @@ def _num(val) -> float:
     except (ValueError, TypeError):
         return 0.0
 
-
 def _safe(row, idx, default="?"):
     return row[idx] if len(row) > idx else default
-
 
 def classify_order(emir_tipi: str) -> tuple[bool, bool]:
     et = (emir_tipi or "").lower()
@@ -100,18 +96,14 @@ def classify_order(emir_tipi: str) -> tuple[bool, bool]:
     is_buy  = not is_sell and any(k in et for k in ["alış", "alish", "buy"])
     return is_buy, is_sell
 
-
 def get_currency_label(para_birimi: str) -> str:
     return "TL" if (para_birimi or "").upper() == "TL" else "USDT"
 
-
 def split_datetime(raw: str) -> tuple[str, str]:
-    """'6 Mart 2026, 12:55:06' → ('6 Mart 2026', '12:55:06')"""
     if "," in raw:
         t, s = [x.strip() for x in raw.split(",", 1)]
         return t, s
     return raw, ""
-
 
 def safe_komisyon(raw) -> float:
     try:
@@ -119,8 +111,6 @@ def safe_komisyon(raw) -> float:
     except (ValueError, TypeError):
         return 0.0
 
-
-# ─── Claude vision ───────────────────────────────────────────────────────────
 def _detect_image_type(data: bytes) -> str:
     if data[:8] == b'\x89PNG\r\n\x1a\n':
         return "image/png"
@@ -131,7 +121,6 @@ def _detect_image_type(data: bytes) -> str:
     if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
         return "image/webp"
     return "image/jpeg"
-
 
 def extract_trade_data(image_bytes: bytes) -> dict:
     media_type = _detect_image_type(image_bytes)
@@ -150,8 +139,6 @@ def extract_trade_data(image_bytes: bytes) -> dict:
     raw = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
-
-# ─── Sheet yardımcıları ───────────────────────────────────────────────────────
 def get_or_create_islem_ws(sh):
     try:
         return sh.worksheet("İşlem Kayıtları")
@@ -165,7 +152,6 @@ def get_or_create_islem_ws(sh):
         ])
         return ws
 
-
 def get_or_create_kz_ws(sh):
     try:
         return sh.worksheet("Kar-Zarar")
@@ -174,19 +160,7 @@ def get_or_create_kz_ws(sh):
         ws.append_row(KZ_HEADERS)
         return ws
 
-
-# ─── ANA FONKSİYON: append_to_sheet (pozisyon havuzu mantığı) ─────────────────
-#
-# Kar-Zarar sekmesindeki mantık:
-#   - Her AÇIK satır bir alış partisini temsil eder (birden fazla olabilir)
-#   - Satış geldiğinde: FIFO sırasıyla AÇIK satırları tüketir
-#       • Satış miktarı = açık alış miktarı → satır kapatılır (KAR/ZARAR)
-#       • Satış miktarı < açık alış miktarı → alış satırı güncellenir (kalan miktar/tutar),
-#         ayrı bir "kapalı" satır eklenir
-#       • Satış miktarı > tek alış → birden fazla alış satırı tüketilir
-#   - Alış geldiğinde: UNMATCHED bekleyen satış varsa önce onunla eşleştir,
-#     yoksa yeni AÇIK satır ekle
-#
+# ─── Sadece Ham Veriyi Kaydetme ──────────────────────────────────────────────
 def append_to_sheet(data: dict) -> tuple[bool, bool]:
     gc  = sheets_client()
     sh  = gc.open_by_key(SHEET_ID)
@@ -200,7 +174,6 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
     tarih_part, saat_part = split_datetime(gerceklesme_raw)
     komisyon_val = safe_komisyon(data.get("komisyon"))
 
-    # ── İşlem Kayıtları ──────────────────────────────────────────────────────
     islem_ws = get_or_create_islem_ws(sh)
     islem_ws.append_row([
         tarih_part, saat_part,
@@ -213,542 +186,318 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
         para_birimi,
     ], value_input_option="USER_ENTERED")
 
-    # ── Kar-Zarar (pozisyon havuzu) ───────────────────────────────────────────
-    # Kural: eşleşme = kaynak satırı sil + yeni satır(lar) sona ekle.
-    # Böylece update/cache tutarsızlığı ve "eski satır kalma" sorunu olmaz.
-    kz_ws    = get_or_create_kz_ws(sh)
-    all_rows = kz_ws.get_all_values()   # [header, row1, row2, ...]
-
-    if not token:
-        return is_buy, is_sell
-
-    def row_matches(r, status):
-        return (
-            len(r) > C["DURUM"] and
-            r[C["TOKEN"]].upper() == token and
-            r[C["PARA BİRİMİ"]]   == para_birimi and
-            r[C["DURUM"]]         == status
-        )
-
-    def calc_pnl(buy_amt, buy_fee, sell_amt, sell_fee):
-        brut = round(sell_amt - buy_amt, 4)
-        pct  = round((brut / buy_amt * 100) if buy_amt else 0.0, 2)
-        net  = round(brut - buy_fee - sell_fee, 4)
-        return brut, pct, net, ("KAR ✅" if net > 0 else "ZARAR ❌")
-
-    def closed_row(buy_date, buy_price, buy_qty, buy_amt, buy_fee,
-                   sell_date, sell_price, sell_amt, sell_fee, brut, pct, net, status):
-        return [
-            token, para_birimi,
-            buy_date, sell_date, buy_qty,
-            buy_price, sell_price,
-            buy_fee, sell_fee,
-            buy_amt, sell_amt,
-            brut, pct, net, status,
-        ]
-
-    def open_row(buy_date, buy_price, buy_qty, buy_amt, buy_fee):
-        return [
-            token, para_birimi,
-            buy_date, "",
-            buy_qty, buy_price, "",
-            buy_fee, "",
-            buy_amt, "", "", "", "", STATUS_ACIK,
-        ]
-
-    def unmatched_row(sell_date, sell_price, sell_qty, sell_amt, sell_fee):
-        # SATIŞ bilgileri SATIŞ sütunlarında, ALIŞ sütunları boş
-        return [
-            token, para_birimi,
-            "", sell_date,
-            sell_qty, "", sell_price,
-            "", sell_fee,
-            "", sell_amt, "", "", "", UNMATCHED,
-        ]
-
-    # ── ALIŞ ─────────────────────────────────────────────────────────────────
-    if is_buy:
-        buy_qty    = _num(data.get("gerceklesen_miktar_token"))
-        buy_amount = _num(data.get("gerceklesen_tutar"))
-        buy_price  = _num(data.get("gerceklesen_fiyat") or data.get("limit_fiyat"))
-        buy_fee    = komisyon_val
-
-        # İlk UNMATCHED satışı bul (FIFO)
-        pending = next(
-            ((i + 1, r) for i, r in enumerate(all_rows[1:], start=1) if row_matches(r, UNMATCHED)),
-            None
-        )
-
-        if pending:
-            ps_idx, ps_row = pending
-            sheet_row  = ps_idx + 1   # gspread 1-based
-
-            sell_qty_p   = _num(ps_row[C["ALIŞ MİKTAR"]])   # unmatched_row'da qty ALIŞ MİKTAR'da
-            sell_amt_p   = _num(ps_row[C["SATIŞ TUTAR"]])
-            sell_fee_p   = _num(ps_row[C["SATIŞ KOM"]])
-            sell_price_p = _num(ps_row[C["SATIŞ FİYAT"]])
-            sell_date_p  = ps_row[C["SATIŞ TARİHİ"]]
-            matched    = min(buy_qty, sell_qty_p)
-            b_ratio    = matched / buy_qty    if buy_qty    > 0 else 1.0
-            s_ratio    = matched / sell_qty_p if sell_qty_p > 0 else 1.0
-            u_b_amt    = round(buy_amount  * b_ratio, 4)
-            u_b_fee    = round(buy_fee     * b_ratio, 4)
-            u_s_amt    = round(sell_amt_p  * s_ratio, 4)
-            u_s_fee    = round(sell_fee_p  * s_ratio, 4)
-            brut, pct, net, status = calc_pnl(u_b_amt, u_b_fee, u_s_amt, u_s_fee)
-
-            # Kaynak UNMATCHED satırı sil
-            kz_ws.delete_rows(sheet_row)
-
-            # Kapalı satır ekle
-            kz_ws.append_row(
-                closed_row(gerceklesme_raw, buy_price, matched, u_b_amt, u_b_fee,
-                           sell_date_p, sell_price_p, u_s_amt, u_s_fee,
-                           brut, pct, net, status),
-                value_input_option="USER_ENTERED",
-            )
-
-            # Alıştan kalan → yeni AÇIK
-            leftover_qty = round(buy_qty - matched, 8)
-            if leftover_qty > 0.000001:
-                kz_ws.append_row(
-                    open_row(gerceklesme_raw, buy_price,
-                             leftover_qty,
-                             round(buy_amount - u_b_amt, 4),
-                             round(buy_fee    - u_b_fee, 4)),
-                    value_input_option="USER_ENTERED",
-                )
-        else:
-            # Bekleyen satış yok → yeni AÇIK
-            kz_ws.append_row(
-                open_row(gerceklesme_raw, buy_price, buy_qty, buy_amount, buy_fee),
-                value_input_option="USER_ENTERED",
-            )
-
-    # ── SATIŞ ────────────────────────────────────────────────────────────────
-   
-    elif is_sell:
-        sell_qty    = _num(data.get("gerceklesen_miktar_token"))
-        sell_amount = _num(data.get("gerceklesen_tutar"))
-        sell_price  = _num(data.get("gerceklesen_fiyat") or data.get("limit_fiyat"))
-        sell_fee    = komisyon_val
-
-        # AÇIK alışları FIFO sırasıyla bul (Döngüde satır silmek yerine indeksleri ve satır numaralarını güncel tutacağız)
-        open_buys = [
-            {"row_num": i + 1, "data": r}
-            for i, r in enumerate(all_rows[1:], start=1)
-            if row_matches(r, STATUS_ACIK)
-        ]
-
-        if not open_buys:
-            kz_ws.append_row(
-                unmatched_row(gerceklesme_raw, sell_price, sell_qty, sell_amount, sell_fee),
-                value_input_option="USER_ENTERED",
-            )
-            return is_buy, is_sell
-
-        remaining_sell     = sell_qty
-        remaining_sell_amt = sell_amount
-        deleted_count = 0  # Silinen satır sayısını tutarak aşağıdaki satırların yukarı kaymasını hesaplıyoruz
-
-        for buy_item in open_buys:
-            if remaining_sell <= 0.000001:
-                break
-
-            buy_row = buy_item["data"]
-            # Her silinen satır sonrası alttaki satırlar 1 yukarı kayar:
-            sheet_row = buy_item["row_num"] - deleted_count
-
-            avail_qty   = _num(buy_row[C["ALIŞ MİKTAR"]])
-            avail_amt   = _num(buy_row[C["ALIŞ TUTAR"]])
-            avail_fee   = _num(buy_row[C["ALIŞ KOM"]])
-            buy_price_r = _num(buy_row[C["ALIŞ FİYAT"]])
-            buy_date    = buy_row[C["ALIŞ TARİHİ"]]
-
-            if avail_qty <= 0:
-                continue
-
-            matched  = min(remaining_sell, avail_qty)
-            b_ratio  = matched / avail_qty
-            s_ratio  = matched / sell_qty if sell_qty > 0 else 1.0
-
-            u_b_amt  = round(avail_amt  * b_ratio, 4)
-            u_b_fee  = round(avail_fee  * b_ratio, 4)
-            u_s_amt  = round(sell_amount * s_ratio, 4)
-            u_s_fee  = round(sell_fee    * s_ratio, 4)
-            brut, pct, net, status = calc_pnl(u_b_amt, u_b_fee, u_s_amt, u_s_fee)
-
-            # 1) Eski AÇIK satırı tablodan KESİN olarak sildiriyoruz
-            kz_ws.delete_rows(sheet_row)
-            deleted_count += 1
-
-            # 2) Yeni kapanan KAR/ZARAR satırını tablonun en altına ekliyoruz
-            kz_ws.append_row(
-                closed_row(buy_date, buy_price_r, matched, u_b_amt, u_b_fee,
-                           gerceklesme_raw, sell_price, u_s_amt, u_s_fee,
-                           brut, pct, net, status),
-                value_input_option="USER_ENTERED",
-            )
-
-            # Kısmi eşleşme: Eğer alış miktarı satıştan fazlaysa, kalan miktar için yeni bir AÇIK satır açıyoruz
-            leftover_qty = round(avail_qty - matched, 8)
-            if leftover_qty > 0.000001:
-                kz_ws.append_row(
-                    open_row(buy_date, buy_price_r,
-                             leftover_qty,
-                             round(avail_amt - u_b_amt, 4),
-                             round(avail_fee - u_b_fee, 4)),
-                    value_input_option="USER_ENTERED",
-                )
-
-            remaining_sell     -= matched
-            remaining_sell_amt -= u_s_amt
-
-        # Satıştan hâlâ kalan miktar varsa → UNMATCHED olarak ekle
-        if remaining_sell > 0.000001:
-            s_ratio   = remaining_sell / sell_qty if sell_qty > 0 else 1.0
-            kz_ws.append_row(
-                unmatched_row(gerceklesme_raw, sell_price,
-                              round(remaining_sell, 8),
-                              round(remaining_sell_amt, 4),
-                              round(sell_fee * s_ratio, 4)),
-                value_input_option="USER_ENTERED",
-            )
-
     return is_buy, is_sell
 
+# ─── Çekirdek Sıralama Motoru ────────────────────────────────────────────────
+def jorik_sirala():
+    gc = sheets_client()
+    sh = gc.open_by_key(SHEET_ID)
+    islem_ws = get_or_create_islem_ws(sh)
+    
+    all_rows = islem_ws.get_all_values()
+    if len(all_rows) <= 1:
+        return False
+        
+    header = all_rows[0]
+    data_rows = all_rows[1:]
+    
+    def parse_row_date(row):
+        try:
+            dt_str = f"{row[0]} {row[1]}".strip()
+            months = {"Ocak":"01","Şubat":"02","Mart":"03","Nisan":"04","Mayıs":"05","Haziran":"06","Temmuz":"07","Ağustos":"08","Eylül":"09","Ekim":"10","Kasım":"11","Aralık":"12"}
+            for m_name, m_num in months.items():
+                dt_str = dt_str.replace(m_name, m_num)
+            return datetime.strptime(dt_str, "%d.%m.%Y %H:%M:%S")
+        except Exception:
+            return datetime.min
 
-# ─── Telegram handlers ────────────────────────────────────────────────────────
+    data_rows.sort(key=parse_row_date)
+    islem_ws.clear()
+    islem_ws.append_rows([header] + data_rows, value_input_option="USER_ENTERED")
+    return True
+
+# ─── Çekirdek Eşleştirme Motoru (FIFO) ───────────────────────────────────────
+def jorik_eslestir():
+    gc = sheets_client()
+    sh = gc.open_by_key(SHEET_ID)
+    
+    islem_ws = get_or_create_islem_ws(sh)
+    kz_ws = get_or_create_kz_ws(sh)
+    
+    islem_rows = islem_ws.get_all_values()
+    if len(islem_rows) <= 1:
+        return False
+        
+    kz_ws.clear()
+    kz_ws.append_row(KZ_HEADERS)
+    
+    pool = {}
+    final_rows = []
+
+    def calc_pnl(b_amt, b_fee, s_amt, s_fee):
+        brut = round(s_amt - b_amt, 4)
+        pct  = round((brut / b_amt * 100) if b_amt else 0.0, 2)
+        net  = round(brut - b_fee - s_fee, 4)
+        return brut, pct, net, ("KAR ✅" if net > 0 else "ZARAR ❌")
+
+    for r in islem_rows[1:]:
+        if len(r) < 10: continue
+        tarih, saat, emir_tipi, token, miktar_raw, fiyat_raw, _, komisyon_raw, tutar_raw, pb = r
+        token = token.strip().upper()
+        pb = pb.strip().upper()
+        
+        qty = _num(miktar_raw)
+        price = _num(fiyat_raw)
+        fee = _num(komisyon_raw)
+        amt = _num(tutar_raw)
+        full_date = f"{tarih} {saat}".strip()
+        
+        is_buy, is_sell = classify_order(emir_tipi)
+        pool_key = f"{token}_{pb}"
+        
+        if pool_key not in pool:
+            pool[pool_key] = []
+            
+        if is_buy:
+            pool[pool_key].append([full_date, price, qty, amt, fee])
+        elif is_sell:
+            rem_sell_qty = qty
+            rem_sell_amt = amt
+            
+            while rem_sell_qty > 0.000001 and pool[pool_key]:
+                b_date, b_price, b_qty, b_amt, b_fee = pool[pool_key][0]
+                matched_qty = min(rem_sell_qty, b_qty)
+                
+                b_ratio = matched_qty / b_qty
+                s_ratio = matched_qty / qty
+                
+                u_b_amt = round(b_amt * b_ratio, 4)
+                u_b_fee = round(b_fee * b_ratio, 4)
+                u_s_amt = round(amt * s_ratio, 4)
+                u_s_fee = round(fee * s_ratio, 4)
+                
+                brut, pct, net, status = calc_pnl(u_b_amt, u_b_fee, u_s_amt, u_s_fee)
+                final_rows.append([
+                    token, pb, b_date, full_date, matched_qty,
+                    b_price, price, u_b_fee, u_s_fee, u_b_amt, u_s_amt,
+                    brut, pct, net, status
+                ])
+                
+                b_qty_left = round(b_qty - matched_qty, 8)
+                if b_qty_left > 0.000001:
+                    pool[pool_key][0] = [
+                        b_date, b_price, b_qty_left,
+                        round(b_amt - u_b_amt, 4),
+                        round(b_fee - u_b_fee, 4)
+                    ]
+                else:
+                    pool[pool_key].pop(0)
+                    
+                rem_sell_qty -= matched_qty
+                rem_sell_amt -= u_s_amt
+                
+            if rem_sell_qty > 0.000001:
+                s_ratio = rem_sell_qty / qty
+                final_rows.append([
+                    token, pb, "", full_date, rem_sell_qty,
+                    "", price, "", round(fee * s_ratio, 4), "", round(amt * s_ratio, 4),
+                    "", "", "", UNMATCHED
+                ])
+
+    for pool_key, open_buys in pool.items():
+        token, pb = pool_key.split("_")
+        for b_date, b_price, b_qty, b_amt, b_fee in open_buys:
+            final_rows.append([
+                token, pb, b_date, "", b_qty,
+                b_price, "", b_fee, "", b_amt,
+                "", "", "", "", STATUS_ACIK
+            ])
+            
+    if final_rows:
+        kz_ws.append_rows(final_rows, value_input_option="USER_ENTERED")
+    return True
+
+# ─── Telegram Komut Arayüzleri ───────────────────────────────────────────────
+def _auth(update) -> bool:
+    user_id = str(update.effective_user.id)
+    return ALLOWED_USERS == {""} or user_id in ALLOWED_USERS
+
+async def cmd_sirala(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _auth(update): return
+    await update.message.reply_text("⏳ İşlem Kayıtları tarih sırasına diziliyor...")
+    if jorik_sirala():
+        await update.message.reply_text("✅ İlk sekme başarıyla kronolojik sıraya dizildi!")
+    else:
+        await update.message.reply_text("📭 Sıralanacak işlem bulunamadı.")
+
+async def cmd_eslestir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _auth(update): return
+    await update.message.reply_text("🔄 Kar-Zarar tablosu FIFO mantığıyla sıfırdan hesaplanıyor...")
+    if jorik_eslestir():
+        await update.message.reply_text("🎯 Kar-Zarar tablosu başarıyla güncellendi!")
+    else:
+        await update.message.reply_text("📭 İşlenecek veri bulunamadı.")
+
+# ─── Gecikmeli Otomatik Tetikleme Havuzu (Debounce) ───────────────────────────
+# Her chat için aktif bir zamanlayıcı görevini ve sayaç durumunu tutar
+_user_tasks = {}
+_pending_counts = {}
+
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if ALLOWED_USERS != {""} and user_id not in ALLOWED_USERS:
         await update.message.reply_text("⛔ Erişim izniniz yok.")
         return
 
-    await update.message.reply_text("📸 Görsel alındı, işleniyor...")
-
+    # Bekleyen işlem sayısını artır
+    _pending_counts[user_id] = _pending_counts.get(user_id, 0) + 1
+    
     photo     = await update.message.photo[-1].get_file()
     img_bytes = await photo.download_as_bytearray()
 
     try:
         data = extract_trade_data(bytes(img_bytes))
-        is_buy, is_sell = append_to_sheet(data)
-
-        para_birimi = get_currency_label(data.get("para_birimi", "USDT"))
-        cur_sym     = "₺" if para_birimi == "TL" else "$"
-        emir_tipi   = data.get("emir_tipi", "")
-        token       = data.get("token", "")
-        fiyat       = data.get("gerceklesen_fiyat") or data.get("limit_fiyat") or ""
-        miktar      = data.get("gerceklesen_miktar_token") or ""
-        tutar       = data.get("gerceklesen_tutar") or ""
-        komisyon    = data.get("komisyon") or ""
-        toplam      = data.get("toplam") or ""
-
-        icon = "🟢" if is_buy else "🔴" if is_sell else "📊"
-        msg = (
-            f"{icon} *{emir_tipi}* kaydedildi!\n\n"
-            f"🪙 Token: `{token}`\n"
-            f"💱 Para Birimi: `{para_birimi}`\n"
-            f"💲 Fiyat: `{cur_sym}{fiyat}`\n"
-            f"📦 Miktar: `{miktar}`\n"
-            f"💰 Tutar: `{cur_sym}{tutar}`\n"
-            f"🏷 Komisyon: `{cur_sym}{komisyon}`\n"
-            f"✅ Toplam: `{cur_sym}{toplam}`\n\n"
-        )
-        if is_sell:
-            msg += "📊 Kar-Zarar hesaplandı ve eşleştirildi!"
-        elif is_buy:
-            msg += "📝 Kar-Zarar sekmesine AÇIK olarak eklendi."
-
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-    except json.JSONDecodeError:
-        await update.message.reply_text("❌ Veri okunamadı. Lütfen net bir ekran görüntüsü gönderin.")
+        append_to_sheet(data)
+        log.info(f"Fotoğraf ham veri olarak eklendi. Chat: {user_id}")
     except Exception as e:
-        log.exception("Hata")
-        await update.message.reply_text(f"⚠️ Hata: {e}")
-
-
-# ─── Komutlar ────────────────────────────────────────────────────────────────
-def _auth(update) -> bool:
-    user_id = str(update.effective_user.id)
-    return ALLOWED_USERS == {""} or user_id in ALLOWED_USERS
-
-
-async def cmd_acik(update, ctx):
-    if not _auth(update):
-        await update.message.reply_text("⛔ Erişim izniniz yok.")
+        log.exception("Görsel işleme hatası")
+        await update.message.reply_text(f"⚠️ Bir görsel okunamadı veya kaydedilemedi: {e}")
+        _pending_counts[user_id] = max(0, _pending_counts.get(user_id, 1) - 1)
         return
+
+    # Eğer bu kullanıcı için zaten çalışan bir geri sayım varsa iptal et (Süreyi uzatıyoruz)
+    if user_id in _user_tasks:
+        _user_tasks[user_id].cancel()
+
+    # Yeni bir geri sayım görevi başlat (5 saniye hareketsizlik bekle)
+    _user_tasks[user_id] = asyncio.create_task(trigger_delayed_sync(update, ctx, user_id))
+
+async def trigger_delayed_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_id: str):
     try:
-        gc  = sheets_client()
-        sh  = gc.open_by_key(SHEET_ID)
-        ws  = sh.worksheet("Kar-Zarar")
+        await asyncio.sleep(5.0)  # Fotoğraflar arası maksimum bekleme penceresi
+        
+        count = _pending_counts.get(user_id, 1)
+        await update.message.reply_text(f"şimdi {count} adet fotoğraf algılandı, arka planda otomatik sıralanıp eşleştiriliyor... ⏳")
+        
+        # Sırasıyla çekirdek motorları çalıştır
+        jorik_sirala()
+        jorik_eslestir()
+        
+        await update.message.reply_text("✅ Gönderdiğiniz tüm fotoğraflar başarıyla kronolojik sıraya dizildi ve Kar-Zarar tablonuz sıfırdan kusursuzca eşleştirildi! 🎯")
+        
+    except asyncio.CancelledError:
+        # Görev iptal edildiyse sorun yok, yeni fotoğraf süreyi sıfırladı demektir
+        pass
+    finally:
+        # Süreç bittiyse havuz kayıtlarını temizle
+        if user_id in _user_tasks and _user_tasks[user_id] == asyncio.current_task():
+            _user_tasks.pop(user_id, None)
+            _pending_counts.pop(user_id, None)
+
+# ─── Diğer Standart Komutlar ve Yapı ─────────────────────────────────────────
+async def cmd_acik(update, ctx):
+    if not _auth(update): return
+    try:
+        gc, sh = sheets_client(), gspread.authorize(Credentials.from_service_account_info(json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"]), scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"])).open_by_key(SHEET_ID)
+        ws = sh.worksheet("Kar-Zarar")
         rows = ws.get_all_values()
         if len(rows) < 2:
             await update.message.reply_text("📭 Henüz kayıt yok.")
             return
-
         acik = [r for r in rows[1:] if len(r) > C["DURUM"] and r[C["DURUM"]] == STATUS_ACIK]
         if not acik:
             await update.message.reply_text("✅ Açık pozisyon yok.")
             return
-
         lines = ["🗂 *Açık Pozisyonlar*\n"]
         for r in acik:
-            pb     = _safe(r, C["PARA BİRİMİ"])
-            cur    = "₺" if pb == "TL" else "$"
-            tok    = _safe(r, C["TOKEN"])
-            fiyat  = _safe(r, C["ALIŞ FİYAT"])
-            miktar = _safe(r, C["ALIŞ MİKTAR"])
-            tutar  = _safe(r, C["ALIŞ TUTAR"])
-            lines.append(f"🪙 *{tok}* ({pb})")
-            lines.append(f"   Alış: `{cur}{fiyat}` × `{miktar}`")
-            lines.append(f"   Tutar: `{cur}{tutar}`\n")
+            pb, cur = _safe(r, C["PARA BİRİMİ"]), "₺" if _safe(r, C["PARA BİRİMİ"]) == "TL" else "$"
+            lines.append(f"🪙 *{_safe(r, C['TOKEN'])}* ({pb})\n   Alış: `{cur}{_safe(r, C['ALIŞ FİYAT'])}` × `{_safe(r, C['ALIŞ MİKTAR'])}` \n   Tutar: `{cur}{_safe(r, C['ALIŞ TUTAR'])}`\n")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    except gspread.WorksheetNotFound:
-        await update.message.reply_text("📭 Henüz kayıt yok.")
-    except Exception as e:
-        log.exception("Hata")
-        await update.message.reply_text(f"⚠️ Hata: {e}")
-
+    except Exception as e: await update.message.reply_text(f"⚠️ Hata: {e}")
 
 def get_pnl_rows(para_birimi_filter):
-    gc  = sheets_client()
-    sh  = gc.open_by_key(SHEET_ID)
-    try:
-        ws = sh.worksheet("Kar-Zarar")
-    except gspread.WorksheetNotFound:
-        return []
-    rows = ws.get_all_values()
-    if len(rows) < 2:
-        return []
-    return [r for r in rows[1:] if len(r) > C["PARA BİRİMİ"] and r[C["PARA BİRİMİ"]] == para_birimi_filter]
-
+    try: return [r for r in sheets_client().open_by_key(SHEET_ID).worksheet("Kar-Zarar").get_all_values()[1:] if len(r) > C["PARA BİRİMİ"] and r[C["PARA BİRİMİ"]] == para_birimi_filter]
+    except: return []
 
 async def cmd_ozet(update, ctx, para_birimi):
-    if not _auth(update):
-        await update.message.reply_text("⛔ Erişim izniniz yok.")
-        return
+    if not _auth(update): return
     cur = "₺" if para_birimi == "TL" else "$"
     try:
         rows = get_pnl_rows(para_birimi)
         if not rows:
             await update.message.reply_text(f"📭 {para_birimi} işlemi bulunamadı.")
             return
-
-        kapali       = [r for r in rows if len(r) > C["DURUM"] and r[C["DURUM"]] not in (STATUS_ACIK, UNMATCHED)]
-        acik         = [r for r in rows if len(r) > C["DURUM"] and r[C["DURUM"]] == STATUS_ACIK]
-        toplam_net   = sum(_num(r[C["NET K/Z"]])   for r in kapali if len(r) > C["NET K/Z"])
-        toplam_brut  = sum(_num(r[C["BRÜT K/Z"]])  for r in kapali if len(r) > C["BRÜT K/Z"])
-        kar_sayisi   = sum(1 for r in kapali if len(r) > C["DURUM"] and "KAR"   in r[C["DURUM"]])
-        zarar_sayisi = sum(1 for r in kapali if len(r) > C["DURUM"] and "ZARAR" in r[C["DURUM"]])
-        acik_tutar   = sum(_num(r[C["ALIŞ TUTAR"]]) for r in acik  if len(r) > C["ALIŞ TUTAR"])
-        icon = "📈" if toplam_net >= 0 else "📉"
-        lines = [
-            f"{icon} *{para_birimi} Özeti*\n",
-            f"💰 Net K/Z: `{cur}{round(toplam_net, 2)}`",
-            f"📊 Brüt K/Z: `{cur}{round(toplam_brut, 2)}`\n",
-            f"✅ Kârlı işlem: `{kar_sayisi}`",
-            f"❌ Zararlı işlem: `{zarar_sayisi}`",
-            f"🗂 Açık pozisyon: `{len(acik)}`",
-            f"💼 Açık tutar: `{cur}{round(acik_tutar, 2)}`",
-        ]
+        kapali = [r for r in rows if len(r) > C["DURUM"] and r[C["DURUM"]] not in (STATUS_ACIK, UNMATCHED)]
+        acik = [r for r in rows if len(r) > C["DURUM"] and r[C["DURUM"]] == STATUS_ACIK]
+        toplam_net = sum(_num(r[C["NET K/Z"]]) for r in kapali)
+        toplam_brut = sum(_num(r[C["BRÜT K/Z"]]) for r in kapali)
+        lines = [f"📈 *{para_birimi} Özeti*\n", f"💰 Net K/Z: `{cur}{round(toplam_net, 2)}`", f"📊 Brüt K/Z: `{cur}{round(toplam_brut, 2)}` \n", f"✅ Kârlı işlem: `{sum(1 for r in kapali if 'KAR' in r[C['DURUM']])}`", f"❌ Zararlı işlem: `{sum(1 for r in kapali if 'ZARAR' in r[C['DURUM']])}`", f"🗂 Açık pozisyon: `{len(acik)}`", f"💼 Açık tutar: `{cur}{round(sum(_num(r[C['ALIŞ TUTAR']]) for r in acik), 2)}`"]
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        log.exception("Hata")
-        await update.message.reply_text(f"⚠️ Hata: {e}")
+    except Exception as e: await update.message.reply_text(f"⚠️ Hata: {e}")
 
-
-async def cmd_ozet_usdt(update, ctx):
-    await cmd_ozet(update, ctx, "USDT")
-
-
-async def cmd_ozet_tl(update, ctx):
-    await cmd_ozet(update, ctx, "TL")
-
+async def cmd_ozet_usdt(update, ctx): await cmd_ozet(update, ctx, "USDT")
+async def cmd_ozet_tl(update, ctx): await cmd_ozet(update, ctx, "TL")
 
 async def cmd_token(update, ctx):
-    if not _auth(update):
-        await update.message.reply_text("⛔ Erişim izniniz yok.")
-        return
-    if not ctx.args:
-        await update.message.reply_text("Kullanım: /token ELIZAOS")
-        return
+    if not _auth(update): return
+    if not ctx.args: return await update.message.reply_text("Kullanım: /token ELIZAOS")
     aranan = ctx.args[0].upper()
     try:
-        gc   = sheets_client()
-        sh   = gc.open_by_key(SHEET_ID)
-        ws   = sh.worksheet("Kar-Zarar")
-        rows = ws.get_all_values()
-        if len(rows) < 2:
-            await update.message.reply_text("📭 Kayıt yok.")
-            return
-
+        rows = sheets_client().open_by_key(SHEET_ID).worksheet("Kar-Zarar").get_all_values()
         eslesen = [r for r in rows[1:] if len(r) > C["TOKEN"] and r[C["TOKEN"]].upper() == aranan]
-        if not eslesen:
-            await update.message.reply_text(f"❌ `{aranan}` için kayıt bulunamadı.", parse_mode="Markdown")
-            return
-
+        if not eslesen: return await update.message.reply_text(f"❌ `{aranan}` için kayıt bulunamadı.", parse_mode="Markdown")
         lines = [f"🔍 *{aranan} Geçmişi*\n"]
         for r in eslesen:
-            pb    = _safe(r, C["PARA BİRİMİ"])
-            cur   = "₺" if pb == "TL" else "$"
-            durum = _safe(r, C["DURUM"])
-            a_tar = _safe(r, C["ALIŞ TARİHİ"])
-            a_fiy = _safe(r, C["ALIŞ FİYAT"])
-            a_mik = _safe(r, C["ALIŞ MİKTAR"])
-            net   = _safe(r, C["NET K/Z"])
-            pct   = _safe(r, C["K/Z %"])
-
-            if durum == STATUS_ACIK:
-                lines.append(f"🗂 *AÇIK* | {pb}")
-                lines.append(f"   Alış: `{a_tar}` @ `{cur}{a_fiy}` × `{a_mik}`\n")
-            elif durum == UNMATCHED:
-                s_tar = _safe(r, C["SATIŞ TARİHİ"])
-                s_mik = _safe(r, C["ALIŞ MİKTAR"])
-                lines.append(f"⚠️ EŞLEŞMEDİ | {pb}")
-                lines.append(f"   Satış: `{s_tar}` × `{s_mik}`\n")
-            else:
-                s_tar = _safe(r, C["SATIŞ TARİHİ"])
-                lines.append(f"{durum} | {pb}")
-                lines.append(f"   Alış: `{a_tar}` @ `{cur}{a_fiy}`")
-                lines.append(f"   Satış: `{s_tar}`")
-                lines.append(f"   Net K/Z: `{cur}{net}` (`%{pct}`)\n")
-
+            pb, cur, durum = _safe(r, C["PARA BİRİMİ"]), "₺" if _safe(r, C["PARA BİRİMİ"]) == "TL" else "$", _safe(r, C["DURUM"])
+            if durum == STATUS_ACIK: lines.append(f"🗂 *AÇIK* | {pb}\n   Alış: `{_safe(r, C['ALIŞ TARİHİ'])}` @ `{cur}{_safe(r, C['ALIŞ FİYAT'])}` × `{_safe(r, C['ALIŞ MİKTAR'])}` \n")
+            elif durum == UNMATCHED: lines.append(f"⚠️ EŞLEŞMEDİ | {pb}\n   Satış: `{_safe(r, C['SATIŞ TARİHİ'])}` × `{_safe(r, C['ALIŞ MİKTAR'])}` \n")
+            else: lines.append(f"{durum} | {pb}\n   Alış: `{_safe(r, C['ALIŞ TARİHİ'])}` @ `{cur}{_safe(r, C['ALIŞ FİYAT'])}` \n   Satış: `{_safe(r, C['SATIŞ TARİHİ'])}` \n   Net K/Z: `{cur}{_safe(r, C['NET K/Z'])}` (`%{_safe(r, C['K/Z %'])}`)\n")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    except gspread.WorksheetNotFound:
-        await update.message.reply_text("📭 Kayıt yok.")
-    except Exception as e:
-        log.exception("Hata")
-        await update.message.reply_text(f"⚠️ Hata: {e}")
-
+    except Exception as e: await update.message.reply_text(f"⚠️ Hata: {e}")
 
 async def cmd_yardim(update, ctx):
-    if not _auth(update):
-        await update.message.reply_text("⛔ Erişim izniniz yok.")
-        return
-    msg = (
-        "🤖 *Kripto İşlem Kayıt Botu*\n\n"
+    await update.message.reply_text(
+        "🤖 *Kripto İşlem Kayıt Botu (Akıllı Otomatik FIFO Modu)*\n\n"
         "📸 *Nasıl kullanılır?*\n"
-        "Herhangi bir borsadan işlem ekran görüntüsü atın, bot otomatik kaydeder.\n\n"
-        "📊 *Sorgulama Komutları*\n"
-        "/acik — Tüm açık pozisyonları listeler\n"
-        "/ozet_usdt — USDT işlemlerinin toplam kar/zarar özeti\n"
-        "/ozet_tl — TL işlemlerinin toplam kar/zarar özeti\n"
-        "/token ELIZAOS — Belirli bir tokenin tüm alış/satış geçmişi\n\n"
-        "🗑 *Silme Komutları*\n"
-        "/sil — Son kaydedilen işlemi siler\n"
-        "/sil ELIZAOS — O tokena ait son kaydı siler\n"
-        "/sifirla — Tüm verileri siler (çift onay gerektirir)\n\n"
-        "ℹ️ *Bilgi*\n"
-        "USDT ve TL işlemleri ayrı takip edilir.\n"
-        "Çok alış → tek/kısmi satış senaryoları desteklenir.\n"
-        "Satışı alıştan önce atsan da otomatik eşleştirilir."
+        "Fotoğrafları ister tek tek, ister *toplu albüm* halinde gönderin. Bot hepsini hafızaya alır, fotoğraf akışınız durduktan 5 saniye sonra otomatik sıralar ve tüm havuzunuzu hatasızca baştan aşağı eşleştirir.\n\n"
+        "📊 *Sorgulama ve Manuel Yönetim*\n"
+        "/sirala — Manuel kronolojik sıralama\n"
+        "/eslestir — Manuel FIFO hesaplama motoru\n"
+        "/acik — Tüm açık pozisyonlar\n"
+        "/ozet_usdt — USDT K/Z özeti\n"
+        "/ozet_tl — TL K/Z özeti\n"
+        "/token [AD] — Özel token geçmişi\n"
+        "/sil — Son kaydı temizler", parse_mode="Markdown"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
 
-
-# ─── Silme komutları ──────────────────────────────────────────────────────────
 async def cmd_sil(update, ctx):
-    if not _auth(update):
-        await update.message.reply_text("⛔ Erişim izniniz yok.")
-        return
-    _sifirla_onay.pop(str(update.effective_user.id), None)
-    token_filtre = ctx.args[0].upper() if ctx.args else None
+    if not _auth(update): return
     try:
-        gc = sheets_client()
-        sh = gc.open_by_key(SHEET_ID)
-
+        sh = sheets_client().open_by_key(SHEET_ID)
         for sekme, token_col in [("İşlem Kayıtları", 3), ("Kar-Zarar", C["TOKEN"])]:
-            try:
-                ws   = sh.worksheet(sekme)
-                rows = ws.get_all_values()
-                for i in range(len(rows) - 1, 0, -1):
-                    r = rows[i]
-                    if token_filtre is None or (len(r) > token_col and r[token_col].upper() == token_filtre):
-                        ws.delete_rows(i + 1)
-                        break
-            except gspread.WorksheetNotFound:
-                pass
-
-        label = f"`{token_filtre}` son kaydı" if token_filtre else "Son kayıt"
-        await update.message.reply_text(f"✅ {label} silindi.", parse_mode="Markdown")
-    except Exception as e:
-        log.exception("Hata")
-        await update.message.reply_text(f"⚠️ Hata: {e}")
-
-
-_sifirla_onay = {}
-
-
-async def cmd_sifirla(update, ctx):
-    if not _auth(update):
-        await update.message.reply_text("⛔ Erişim izniniz yok.")
-        return
-    user_id = str(update.effective_user.id)
-
-    if _sifirla_onay.get(user_id):
-        _sifirla_onay.pop(user_id, None)
-        try:
-            gc = sheets_client()
-            sh = gc.open_by_key(SHEET_ID)
-            for sekme in ["İşlem Kayıtları", "Kar-Zarar"]:
-                try:
-                    sh.del_worksheet(sh.worksheet(sekme))
-                except gspread.WorksheetNotFound:
-                    pass
-            await update.message.reply_text("🗑 Tüm veriler silindi.")
-        except Exception as e:
-            log.exception("Hata")
-            await update.message.reply_text(f"⚠️ Hata: {e}")
-    else:
-        _sifirla_onay[user_id] = True
-        await update.message.reply_text(
-            "⚠️ *Tüm veriler silinecek!*\n\n"
-            "Emin misiniz? Onaylamak için tekrar /sifirla yazın.\n"
-            "Vazgeçmek için herhangi bir şey yazın.",
-            parse_mode="Markdown",
-        )
-
+            ws = sh.worksheet(sekme)
+            rows = ws.get_all_values()
+            if len(rows) > 1: ws.delete_rows(len(rows))
+        await update.message.reply_text("✅ Son eklenen ham kayıt ve Kar-Zarar satırı silindi. Doğru sıraya oturması için komutları elinizle tetikleyebilirsiniz.")
+    except Exception as e: await update.message.reply_text(f"⚠️ Hata: {e}")
 
 async def handle_text(update, ctx):
-    user_id = str(update.effective_user.id)
-    if _sifirla_onay.pop(user_id, None):
-        await update.message.reply_text("❌ Sıfırlama iptal edildi.")
-        return
+    await update.message.reply_text("👋 Ekran görüntülerinizi toplu veya tek tek gönderebilirsiniz. Sistem otomatik işleyip havuzu güncelleyecektir. Komut listesi için /yardim yazabilirsiniz.")
 
-    await update.message.reply_text(
-        "👋 Merhaba! İşlem detayı ekran görüntüsü gönderin, otomatik kaydedeyim.\n\n"
-        "📸 Desteklenen: Binance, Bybit, OKX, BtcTurk, Paribu ve diğer tüm borsalar.\n"
-        "💱 USDT ve TL işlemleri desteklenir.\n\n"
-        "📊 *Komutlar:*\n"
-        "/acik — Açık pozisyonlar\n"
-        "/ozet_usdt — USDT özeti\n"
-        "/ozet_tl — TL özeti\n"
-        "/token ELIZAOS — Token geçmişi\n"
-        "/sil — Son kaydı sil\n"
-        "/sil ELIZAOS — Token son kaydını sil\n"
-        "/sifirla — Tüm verileri sil\n"
-        "/yardim — Yardım",
-        parse_mode="Markdown",
-    )
-
-
-# ─── main ─────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("sirala",     cmd_sirala))
+    app.add_handler(CommandHandler("eslestir",   cmd_eslestir))
     app.add_handler(CommandHandler("acik",      cmd_acik))
     app.add_handler(CommandHandler("ozet_usdt", cmd_ozet_usdt))
     app.add_handler(CommandHandler("ozet_tl",   cmd_ozet_tl))
     app.add_handler(CommandHandler("token",     cmd_token))
     app.add_handler(CommandHandler("sil",       cmd_sil))
-    app.add_handler(CommandHandler("sifirla",   cmd_sifirla))
     app.add_handler(CommandHandler("yardim",    cmd_yardim))
     app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    log.info("Bot başlatıldı...")
+    log.info("Bot akıllı dinamik modda başlatıldı...")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
