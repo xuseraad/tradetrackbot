@@ -5,7 +5,7 @@ import logging
 import anthropic
 import gspread
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 
@@ -307,12 +307,179 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Merhaba! İşlem detayı ekran görüntüsü gönderin, otomatik kaydedeyim.\n\n"
         "📸 Desteklenen: Binance, Bybit, OKX, BtcTurk, Paribu ve diğer tüm borsalar.\n"
-        "💱 USDT ve TL işlemleri desteklenir."
+        "💱 USDT ve TL işlemleri desteklenir.\n\n"
+        "📊 *Komutlar:*\n"
+        "/acik — Açık pozisyonlar\n"
+        "/ozet_usdt — USDT özeti\n"
+        "/ozet_tl — TL özeti\n"
+        "/token ELIZAOS — Token geçmişi"
     )
+
+
+
+
+def get_pnl_rows(para_birimi_filter):
+    gc = sheets_client()
+    sh = gc.open_by_key(SHEET_ID)
+    try:
+        ws = sh.worksheet("Kar-Zarar")
+    except gspread.WorksheetNotFound:
+        return []
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return []
+    headers = rows[0]
+    try:
+        pb_col = headers.index("PARA B\u0130R\u0130M\u0130")
+    except ValueError:
+        pb_col = 1
+    return [r for r in rows[1:] if len(r) > pb_col and r[pb_col] == para_birimi_filter]
+
+
+def _safe(row, idx, default="?"):
+    return row[idx] if len(row) > idx else default
+
+
+async def cmd_acik(update, ctx):
+    user_id = str(update.effective_user.id)
+    if ALLOWED_USERS != {""} and user_id not in ALLOWED_USERS:
+        await update.message.reply_text("\u26d4 Eri\u015fim izniniz yok.")
+        return
+    try:
+        gc = sheets_client()
+        sh = gc.open_by_key(SHEET_ID)
+        ws = sh.worksheet("Kar-Zarar")
+        rows = ws.get_all_values()
+        if len(rows) < 2:
+            await update.message.reply_text("\U0001f4ed Hen\u00fcz kay\u0131t yok.")
+            return
+        headers = rows[0]
+        try:
+            status_col = headers.index("DURUM")
+            token_col  = headers.index("TOKEN")
+            pb_col     = headers.index("PARA B\u0130R\u0130M\u0130")
+            fiyat_col  = headers.index("ALI\u015e F\u0130YAT")
+            miktar_col = headers.index("ALI\u015e M\u0130KTAR")
+            tutar_col  = headers.index("ALI\u015e TUTAR")
+        except ValueError:
+            status_col, token_col, pb_col, fiyat_col, miktar_col, tutar_col = 15, 0, 1, 3, 4, 5
+
+        acik = [r for r in rows[1:] if len(r) > status_col and r[status_col] == "A\u00c7IK"]
+        if not acik:
+            await update.message.reply_text("\u2705 A\u00e7\u0131k pozisyon yok.")
+            return
+
+        lines = ["\U0001f5c2 *A\u00e7\u0131k Pozisyonlar*\n"]
+        for r in acik:
+            token  = _safe(r, token_col)
+            pb     = _safe(r, pb_col)
+            fiyat  = _safe(r, fiyat_col)
+            miktar = _safe(r, miktar_col)
+            tutar  = _safe(r, tutar_col)
+            cur    = "\u20ba" if pb == "TL" else "$"
+            lines.append(f"\U0001fa99 *{token}* ({pb})")
+            lines.append(f"   Al\u0131\u015f: `{cur}{fiyat}` \u00d7 `{miktar}`")
+            lines.append(f"   Tutar: `{cur}{tutar}`\n")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        log.exception("Hata")
+        await update.message.reply_text(f"\u26a0\ufe0f Hata: {e}")
+
+
+async def cmd_ozet(update, ctx, para_birimi):
+    user_id = str(update.effective_user.id)
+    if ALLOWED_USERS != {""} and user_id not in ALLOWED_USERS:
+        await update.message.reply_text("\u26d4 Eri\u015fim izniniz yok.")
+        return
+    cur = "\u20ba" if para_birimi == "TL" else "$"
+    try:
+        rows = get_pnl_rows(para_birimi)
+        if not rows:
+            await update.message.reply_text(f"\U0001f4ed {para_birimi} i\u015flemi bulunamad\u0131.")
+            return
+        kapali      = [r for r in rows if len(r) > 15 and r[15] not in ("A\u00c7IK", "E\u015eLe\u015eMED\u0130 \u26a0\ufe0f")]
+        acik        = [r for r in rows if len(r) > 15 and r[15] == "A\u00c7IK"]
+        toplam_net  = sum(_num(r[14]) for r in kapali if len(r) > 14)
+        toplam_brut = sum(_num(r[12]) for r in kapali if len(r) > 12)
+        kar_sayisi  = sum(1 for r in kapali if len(r) > 15 and "KAR" in r[15])
+        zarar_sayisi= sum(1 for r in kapali if len(r) > 15 and "ZARAR" in r[15])
+        acik_tutar  = sum(_num(r[5]) for r in acik if len(r) > 5)
+        icon = "\U0001f4c8" if toplam_net >= 0 else "\U0001f4c9"
+        lines = [
+            f"{icon} *{para_birimi} \u00d6zeti*\n",
+            f"\U0001f4b0 Net K/Z: `{cur}{round(toplam_net, 2)}`",
+            f"\U0001f4ca Br\u00fct K/Z: `{cur}{round(toplam_brut, 2)}`\n",
+            f"\u2705 K\u00e2rl\u0131 i\u015flem: `{kar_sayisi}`",
+            f"\u274c Zarafl\u0131 i\u015flem: `{zarar_sayisi}`",
+            f"\U0001f5c2 A\u00e7\u0131k pozisyon: `{len(acik)}`",
+            f"\U0001f4bc A\u00e7\u0131k tutar: `{cur}{round(acik_tutar, 2)}`",
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        log.exception("Hata")
+        await update.message.reply_text(f"\u26a0\ufe0f Hata: {e}")
+
+
+async def cmd_ozet_usdt(update, ctx):
+    await cmd_ozet(update, ctx, "USDT")
+
+
+async def cmd_ozet_tl(update, ctx):
+    await cmd_ozet(update, ctx, "TL")
+
+
+async def cmd_token(update, ctx):
+    user_id = str(update.effective_user.id)
+    if ALLOWED_USERS != {""} and user_id not in ALLOWED_USERS:
+        await update.message.reply_text("\u26d4 Eri\u015fim izniniz yok.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("Kullan\u0131m: /token ELIZAOS")
+        return
+    aranan = ctx.args[0].upper()
+    try:
+        gc = sheets_client()
+        sh = gc.open_by_key(SHEET_ID)
+        ws = sh.worksheet("Kar-Zarar")
+        rows = ws.get_all_values()
+        if len(rows) < 2:
+            await update.message.reply_text("\U0001f4ed Kay\u0131t yok.")
+            return
+        eslesen = [r for r in rows[1:] if len(r) > 0 and r[0].upper() == aranan]
+        if not eslesen:
+            await update.message.reply_text(f"\u274c `{aranan}` i\u00e7in kay\u0131t bulunamad\u0131.", parse_mode="Markdown")
+            return
+        lines = [f"\U0001f50d *{aranan} Ge\u00e7mi\u015fi*\n"]
+        for r in eslesen:
+            pb    = _safe(r, 1)
+            cur   = "\u20ba" if pb == "TL" else "$"
+            durum = _safe(r, 15)
+            a_tar = _safe(r, 2)
+            a_fiy = _safe(r, 3)
+            a_mik = _safe(r, 4)
+            net   = _safe(r, 14)
+            pct   = _safe(r, 13)
+            if durum == "A\u00c7IK":
+                lines.append(f"\U0001f5c2 *A\u00c7IK* | {pb}")
+                lines.append(f"   Al\u0131\u015f: `{a_tar}` @ `{cur}{a_fiy}` \u00d7 `{a_mik}`\n")
+            else:
+                s_tar = _safe(r, 7)
+                lines.append(f"{durum} | {pb}")
+                lines.append(f"   Al\u0131\u015f: `{a_tar}` @ `{cur}{a_fiy}`")
+                lines.append(f"   Sat\u0131\u015f: `{s_tar}`")
+                lines.append(f"   Net K/Z: `{cur}{net}` (`%{pct}`)\n")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        log.exception("Hata")
+        await update.message.reply_text(f"\u26a0\ufe0f Hata: {e}")
 
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler('acik', cmd_acik))
+    app.add_handler(CommandHandler('ozet_usdt', cmd_ozet_usdt))
+    app.add_handler(CommandHandler('ozet_tl', cmd_ozet_tl))
+    app.add_handler(CommandHandler('token', cmd_token))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     log.info("Bot başlatıldı...")
