@@ -327,7 +327,7 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
 
     # ── SATIŞ ────────────────────────────────────────────────────────────────
    
-elif is_sell:
+    elif is_sell:
         sell_qty    = _num(data.get("gerceklesen_miktar_token"))
         sell_amount = _num(data.get("gerceklesen_tutar"))
         sell_price  = _num(data.get("gerceklesen_fiyat") or data.get("limit_fiyat"))
