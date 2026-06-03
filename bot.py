@@ -341,7 +341,102 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Hata: {e}")
 
 
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+
+
+# Onay bekleyen sıfırlama istekleri {user_id: True}
+_sifirla_onay = {}
+
+
+async def cmd_sil(update, ctx):
+    user_id = str(update.effective_user.id)
+    if ALLOWED_USERS != {""} and user_id not in ALLOWED_USERS:
+        await update.message.reply_text("⛔ Erişim izniniz yok.")
+        return
+    token_filtre = ctx.args[0].upper() if ctx.args else None
+    try:
+        gc = sheets_client()
+        sh = gc.open_by_key(SHEET_ID)
+
+        # --- İşlem Kayıtları: son eşleşen satırı sil ---
+        try:
+            islem_ws = sh.worksheet("İşlem Kayıtları")
+            islem_rows = islem_ws.get_all_values()
+            # Başlık hariç son satırı bul (token filtresi varsa ona göre)
+            hedef_islem = None
+            for i in range(len(islem_rows) - 1, 0, -1):
+                r = islem_rows[i]
+                if token_filtre is None or (len(r) > 3 and r[3].upper() == token_filtre):
+                    hedef_islem = i + 1  # gspread 1-based
+                    break
+            if hedef_islem:
+                islem_ws.delete_rows(hedef_islem)
+        except gspread.WorksheetNotFound:
+            pass
+
+        # --- Kar-Zarar: son eşleşen satırı sil ---
+        try:
+            pnl_ws = sh.worksheet("Kar-Zarar")
+            pnl_rows = pnl_ws.get_all_values()
+            hedef_pnl = None
+            for i in range(len(pnl_rows) - 1, 0, -1):
+                r = pnl_rows[i]
+                if token_filtre is None or (len(r) > 0 and r[0].upper() == token_filtre):
+                    hedef_pnl = i + 1
+                    break
+            if hedef_pnl:
+                pnl_ws.delete_rows(hedef_pnl)
+        except gspread.WorksheetNotFound:
+            pass
+
+        if token_filtre:
+            await update.message.reply_text(f"✅ `{token_filtre}` son kaydı silindi.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("✅ Son kayıt silindi.")
+    except Exception as e:
+        log.exception("Hata")
+        await update.message.reply_text(f"⚠️ Hata: {e}")
+
+
+async def cmd_sifirla(update, ctx):
+    user_id = str(update.effective_user.id)
+    if ALLOWED_USERS != {""} and user_id not in ALLOWED_USERS:
+        await update.message.reply_text("⛔ Erişim izniniz yok.")
+        return
+
+    if _sifirla_onay.get(user_id):
+        # Onay geldi — sil
+        _sifirla_onay.pop(user_id, None)
+        try:
+            gc = sheets_client()
+            sh = gc.open_by_key(SHEET_ID)
+            for sekme in ["İşlem Kayıtları", "Kar-Zarar"]:
+                try:
+                    ws = sh.worksheet(sekme)
+                    sh.del_worksheet(ws)
+                except gspread.WorksheetNotFound:
+                    pass
+            await update.message.reply_text("🗑 Tüm veriler silindi. Bot yeni kayıtlarda sekmeleri yeniden oluşturacak.")
+        except Exception as e:
+            log.exception("Hata")
+            await update.message.reply_text(f"⚠️ Hata: {e}")
+    else:
+        # İlk çağrı — onay iste
+        _sifirla_onay[user_id] = True
+        await update.message.reply_text(
+            "⚠️ *Tüm veriler silinecek!*\n\n"
+            "Emin misiniz? Onaylamak için tekrar /sifirla yazın.\n"
+            "Vazgeçmek için herhangi bir şey yazın.",
+            parse_mode="Markdown"
+        )
+
+
+async def handle_text(update, ctx):
+    user_id = str(update.effective_user.id)
+    # Sıfırlama onayı bekleniyorsa iptal et
+    if _sifirla_onay.pop(user_id, None):
+        await update.message.reply_text("❌ Sıfırlama iptal edildi.")
+        return
+
     await update.message.reply_text(
         "👋 Merhaba! İşlem detayı ekran görüntüsü gönderin, otomatik kaydedeyim.\n\n"
         "📸 Desteklenen: Binance, Bybit, OKX, BtcTurk, Paribu ve diğer tüm borsalar.\n"
@@ -350,7 +445,10 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/acik — Açık pozisyonlar\n"
         "/ozet_usdt — USDT özeti\n"
         "/ozet_tl — TL özeti\n"
-        "/token ELIZAOS — Token geçmişi"
+        "/token ELIZAOS — Token geçmişi\n"
+        "/sil — Son kaydı sil\n"
+        "/sil ELIZAOS — Token son kaydını sil\n"
+        "/sifirla — Tüm verileri sil"
     )
 
 
@@ -512,12 +610,40 @@ async def cmd_token(update, ctx):
         await update.message.reply_text(f"\u26a0\ufe0f Hata: {e}")
 
 
+
+async def cmd_yardim(update, ctx):
+    user_id = str(update.effective_user.id)
+    if ALLOWED_USERS != {""} and user_id not in ALLOWED_USERS:
+        await update.message.reply_text("⛔ Erişim izniniz yok.")
+        return
+    msg = (
+        "🤖 *Kripto İşlem Kayıt Botu*\n\n"
+        "📸 *Nasıl kullanılır?*\n"
+        "Herhangi bir borsadan işlem ekran görüntüsü atın, bot otomatik kaydeder.\n\n"
+        "📊 *Sorgulama Komutları*\n"
+        "/acik — Tüm açık pozisyonları listeler\n"
+        "/ozet_usdt — USDT işlemlerinin toplam kar/zarar özeti\n"
+        "/ozet_tl — TL işlemlerinin toplam kar/zarar özeti\n"
+        "/token ELIZAOS — Belirli bir tokenin tüm alış/satış geçmişi\n\n"
+        "🗑 *Silme Komutları*\n"
+        "/sil — Son kaydedilen işlemi siler\n"
+        "/sil ELIZAOS — O tokena ait son kaydı siler\n"
+        "/sifirla — Tüm verileri siler \u00e7ift onay gerektirir\n\n"
+        "ℹ️ *Bilgi*\n"
+        "USDT ve TL işlemleri ayrı takip edilir.\n"
+        "Satışı alıştan önce atsanz da otomatik eşleştirilir."
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler('acik', cmd_acik))
     app.add_handler(CommandHandler('ozet_usdt', cmd_ozet_usdt))
     app.add_handler(CommandHandler('ozet_tl', cmd_ozet_tl))
     app.add_handler(CommandHandler('token', cmd_token))
+    app.add_handler(CommandHandler('sil', cmd_sil))
+    app.add_handler(CommandHandler('sifirla', cmd_sifirla))
+    app.add_handler(CommandHandler('yardim', cmd_yardim))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     log.info("Bot başlatıldı...")
