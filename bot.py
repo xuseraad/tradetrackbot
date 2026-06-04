@@ -41,8 +41,8 @@ Emir tipi için: "Limit Alış", "Limit Satış", "Market Alış", "Market Satı
   "durum": "Gerçekleşti / Beklemede / İptal",
   "emir_tarihi": "GG.AA.YYYY SS:DD:SS",
   "gerceklesme_tarihi": "GG.AA.YYYY SS:DD:SS",
-  "girilen_adet": sayı veya null,
-  "limit_fiyat": sayı veya null,
+  "girilen_adet": null,
+  "limit_fiyat": null,
   "gerceklesen_miktar_token": sayı,
   "gerceklesen_fiyat": sayı,
   "gerceklesen_tutar": sayı,
@@ -103,6 +103,9 @@ def split_datetime(raw: str) -> tuple[str, str]:
     if "," in raw:
         t, s = [x.strip() for x in raw.split(",", 1)]
         return t, s
+    if " " in raw.strip():
+        parts = raw.strip().split(" ", 1)
+        return parts[0], parts[1]
     return raw, ""
 
 def safe_komisyon(raw) -> float:
@@ -126,7 +129,7 @@ def extract_trade_data(image_bytes: bytes) -> dict:
     media_type = _detect_image_type(image_bytes)
     b64 = base64.standard_b64encode(image_bytes).decode()
     msg = claude.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-4-20250514",
         max_tokens=1000,
         messages=[{
             "role": "user",
@@ -363,6 +366,9 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("Görsel işleme hatası")
         await update.message.reply_text(f"⚠️ Bir görsel okunamadı veya kaydedilemedi: {e}")
         _pending_counts[user_id] = max(0, _pending_counts.get(user_id, 1) - 1)
+        if user_id in _user_tasks:
+            _user_tasks[user_id].cancel()
+            _user_tasks.pop(user_id, None)
         return
 
     # Eğer bu kullanıcı için zaten çalışan bir geri sayım varsa iptal et (Süreyi uzatıyoruz)
@@ -398,7 +404,7 @@ async def trigger_delayed_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE, u
 async def cmd_acik(update, ctx):
     if not _auth(update): return
     try:
-        gc, sh = sheets_client(), gspread.authorize(Credentials.from_service_account_info(json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"]), scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"])).open_by_key(SHEET_ID)
+        sh = sheets_client().open_by_key(SHEET_ID)
         ws = sh.worksheet("Kar-Zarar")
         rows = ws.get_all_values()
         if len(rows) < 2:
