@@ -146,9 +146,7 @@ def extract_trade_data(image_bytes: bytes) -> dict:
     for attempt in range(3):
         msg = _call()
         raw = msg.content[0].text.strip()
-        # JSON bloğunu temizle
         raw = raw.replace("```json", "").replace("```", "").strip()
-        # Bazen önünde/arkasında metin gelirse sadece { } bloğunu al
         start = raw.find("{")
         end   = raw.rfind("}") + 1
         if start != -1 and end > start:
@@ -159,6 +157,7 @@ def extract_trade_data(image_bytes: bytes) -> dict:
             log.warning(f"JSON parse hatası (deneme {attempt+1}/3): {e}\nHam: {raw[:200]}")
             if attempt == 2:
                 raise ValueError(f"Claude 3 denemede geçerli JSON döndürmedi: {e}") from e
+            continue
 
 def get_or_create_islem_ws(sh):
     try:
@@ -182,14 +181,13 @@ def get_or_create_kz_ws(sh):
         return ws
 
 # ─── Sadece Ham Veriyi Kaydetme ──────────────────────────────────────────────
-def append_to_sheet(data: dict) -> tuple[bool, bool]:
+def append_to_sheet(data: dict) -> None:
     gc  = sheets_client()
     sh  = gc.open_by_key(SHEET_ID)
 
     para_birimi = get_currency_label(data.get("para_birimi", "USDT"))
     emir_tipi   = data.get("emir_tipi", "")
     token       = (data.get("token") or "").strip().upper()
-    is_buy, is_sell = classify_order(emir_tipi)
 
     gerceklesme_raw = data.get("gerceklesme_tarihi") or data.get("emir_tarihi") or ""
     tarih_part, saat_part = split_datetime(gerceklesme_raw)
@@ -206,8 +204,6 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
         data.get("gerceklesen_tutar") or "",
         para_birimi,
     ], value_input_option="USER_ENTERED")
-
-    return is_buy, is_sell
 
 # ─── Çekirdek Sıralama Motoru ────────────────────────────────────────────────
 def jorik_sirala():
@@ -366,7 +362,7 @@ _pending_counts = {}
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    if ALLOWED_USERS != {""} and user_id not in ALLOWED_USERS:
+    if not _auth(update):
         await update.message.reply_text("⛔ Erişim izniniz yok.")
         return
 
@@ -398,15 +394,15 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def trigger_delayed_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_id: str):
     try:
-        await asyncio.sleep(5.0)  # Fotoğraflar arası maksimum bekleme penceresi
-        
+        await asyncio.sleep(5.0)
+
         count = _pending_counts.get(user_id, 1)
         await update.message.reply_text(f"şimdi {count} adet fotoğraf algılandı, arka planda otomatik sıralanıp eşleştiriliyor... ⏳")
-        
-        # Sırasıyla çekirdek motorları çalıştır
-        jorik_sirala()
-        jorik_eslestir()
-        
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, jorik_sirala)
+        await loop.run_in_executor(None, jorik_eslestir)
+
         await update.message.reply_text("✅ Gönderdiğiniz tüm fotoğraflar başarıyla kronolojik sıraya dizildi ve Kar-Zarar tablonuz sıfırdan kusursuzca eşleştirildi! 🎯")
         _pending_counts.pop(user_id, None)
         
@@ -519,7 +515,8 @@ async def cmd_sil(update, ctx):
     ]])
     await update.message.reply_text(
         "⚠️ *Son kaydı silmek istediğinizden emin misiniz?*\n\n"
-        "İşlem Kayıtları ve Kar-Zarar sekmelerindeki son satır silinecek.",
+        "Yalnızca İşlem Kayıtları sekmesindeki son satır silinecek.\n"
+        "Kar-Zarar tablosunu güncellemek için ardından /eslestir çalıştırın.",
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
@@ -576,12 +573,16 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "sil_onayla":
         try:
             sh = sheets_client().open_by_key(SHEET_ID)
-            for sekme in ["İşlem Kayıtları", "Kar-Zarar"]:
-                ws = sh.worksheet(sekme)
-                rows = ws.get_all_values()
-                if len(rows) > 1:
-                    ws.delete_rows(len(rows))
-            await query.edit_message_text("✅ Son kayıt silindi.")
+            ws = sh.worksheet("İşlem Kayıtları")
+            rows = ws.get_all_values()
+            if len(rows) > 1:
+                ws.delete_rows(len(rows))
+                await query.edit_message_text(
+                    "✅ Son kayıt silindi.\n"
+                    "Kar-Zarar tablosunu güncellemek için /eslestir çalıştırın."
+                )
+            else:
+                await query.edit_message_text("📭 Silinecek kayıt yok.")
             log.info("Son satır kullanıcı onayıyla silindi.")
         except Exception as e:
             await query.edit_message_text(f"⚠️ Silme başarısız: {e}")
