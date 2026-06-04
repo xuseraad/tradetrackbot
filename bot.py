@@ -129,7 +129,7 @@ def extract_trade_data(image_bytes: bytes) -> dict:
     media_type = _detect_image_type(image_bytes)
     b64 = base64.standard_b64encode(image_bytes).decode()
     msg = claude.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=1000,
         messages=[{
             "role": "user",
