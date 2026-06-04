@@ -5,8 +5,8 @@ import logging
 import anthropic
 import gspread
 import asyncio
-from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 
@@ -178,6 +178,15 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
     komisyon_val = safe_komisyon(data.get("komisyon"))
 
     islem_ws = get_or_create_islem_ws(sh)
+
+    # ── Mükerrer kontrol: aynı tarih+saat+token var mı? ─────────────────────
+    existing = islem_ws.get_all_values()
+    duplicate_row_index = None
+    for i, row in enumerate(existing[1:], start=2):  # 1. satır başlık
+        if len(row) >= 4 and row[0] == tarih_part and row[1] == saat_part and row[3].upper() == token:
+            duplicate_row_index = i
+            break
+
     islem_ws.append_row([
         tarih_part, saat_part,
         emir_tipi, token,
@@ -189,7 +198,7 @@ def append_to_sheet(data: dict) -> tuple[bool, bool]:
         para_birimi,
     ], value_input_option="USER_ENTERED")
 
-    return is_buy, is_sell
+    return is_buy, is_sell, duplicate_row_index
 
 # ─── Çekirdek Sıralama Motoru ────────────────────────────────────────────────
 def jorik_sirala():
@@ -360,7 +369,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         data = extract_trade_data(bytes(img_bytes))
-        append_to_sheet(data)
+        is_buy, is_sell, duplicate_row = append_to_sheet(data)
         log.info(f"Fotoğraf ham veri olarak eklendi. Chat: {user_id}")
     except Exception as e:
         log.exception("Görsel işleme hatası")
@@ -369,6 +378,27 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if user_id in _user_tasks:
             _user_tasks[user_id].cancel()
             _user_tasks.pop(user_id, None)
+        return
+
+    # ── Mükerrer tespit: kullanıcıya sor ─────────────────────────────────────
+    if duplicate_row is not None:
+        token = (data.get("token") or "?").upper()
+        tarih = data.get("gerceklesme_tarihi") or data.get("emir_tarihi") or "?"
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Evet, sil", callback_data=f"dup_sil:{duplicate_row}"),
+            InlineKeyboardButton("❌ Hayır, kalsın", callback_data="dup_kalsın"),
+        ]])
+        await update.message.reply_text(
+            f"⚠️ *Mükerrer kayıt tespit edildi!*\n\n"
+            f"🪙 Token: `{token}`\n"
+            f"📅 Tarih: `{tarih}`\n\n"
+            f"Bu işlem daha önce kaydedilmiş görünüyor. "
+            f"Eski kaydı silmek ister misiniz?",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        # Debounce sayacını geri al (mükerrer onaylanana kadar sıralama yapma)
+        _pending_counts[user_id] = max(0, _pending_counts.get(user_id, 1) - 1)
         return
 
     # Eğer bu kullanıcı için zaten çalışan bir geri sayım varsa iptal et (Süreyi uzatıyoruz)
@@ -487,6 +517,27 @@ async def cmd_sil(update, ctx):
         await update.message.reply_text("✅ Son eklenen ham kayıt ve Kar-Zarar satırı silindi. Doğru sıraya oturması için komutları elinizle tetikleyebilirsiniz.")
     except Exception as e: await update.message.reply_text(f"⚠️ Hata: {e}")
 
+async def handle_duplicate_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data.startswith("dup_sil:"):
+        row_index = int(query.data.split(":")[1])
+        try:
+            sh = sheets_client().open_by_key(SHEET_ID)
+            islem_ws = sh.worksheet("İşlem Kayıtları")
+            islem_ws.delete_rows(row_index)
+            await query.edit_message_text(
+                "✅ Eski mükerrer kayıt silindi. Yeni kayıt geçerli olarak tutuldu."
+            )
+            log.info(f"Mükerrer satır {row_index} silindi.")
+        except Exception as e:
+            await query.edit_message_text(f"⚠️ Silme işlemi başarısız: {e}")
+    else:
+        await query.edit_message_text(
+            "ℹ️ Her iki kayıt da tutuldu. İstediğinizde /sil komutuyla son kaydı kaldırabilirsiniz."
+        )
+
 async def handle_text(update, ctx):
     await update.message.reply_text("👋 Ekran görüntülerinizi toplu veya tek tek gönderebilirsiniz. Sistem otomatik işleyip havuzu güncelleyecektir. Komut listesi için /yardim yazabilirsiniz.")
 
@@ -502,6 +553,7 @@ def main():
     app.add_handler(CommandHandler("yardim",    cmd_yardim))
     app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(handle_duplicate_callback, pattern="^dup_"))
     log.info("Bot akıllı dinamik modda başlatıldı...")
     app.run_polling(drop_pending_updates=True)
 
