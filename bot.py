@@ -20,25 +20,17 @@ ALLOWED_USERS  = set(os.getenv("ALLOWED_USER_IDS", "").split(","))
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
-EXTRACT_SYSTEM = """Sen bir kripto borsa ekran görüntüsü analiz uzmanısın. 
-Görevin: işlem detayı içeren ekran görüntülerinden verileri doğru ve eksiksiz çıkarmak.
-- Görüntü sıkıştırılmış veya düşük çözünürlüklü olsa bile tüm görünür metni dikkatlice oku.
-- Rakamları, tarihleri ve token isimlerini olduğu gibi al, yorumlama.
-- Sadece geçerli JSON döndür, markdown veya açıklama ekleme."""
+EXTRACT_SYSTEM = "Kripto borsa ekran görüntüsünden işlem verilerini oku ve SADECE geçerli JSON döndür. Açıklama, markdown, kod bloğu ekleme."
 
-EXTRACT_PROMPT = """Bu ekran görüntüsü bir kripto borsasındaki işlem detayı sayfasıdır.
-Aşağıdaki tüm alanları eksiksiz JSON formatında çıkar. Bulunamazsa null yaz.
+EXTRACT_PROMPT = """Ekrandaki tüm rakamları, tarihleri ve isimleri olduğu gibi oku. Hiçbir şeyi yorumlama veya hesaplama.
 
-Para birimi tespiti:
-- ₺ veya TL görünüyorsa → "TL"
-- USDT görünüyorsa → "USDT"
-- /TL çifti varsa → "TL", /USDT varsa → "USDT"
+Şu kurallarla JSON döndür:
+- para_birimi: ekranda TL veya ₺ varsa "TL", USDT varsa "USDT"
+- emir_tipi: ekranda ne yazıyorsa aynen yaz
+- gerceklesme_tarihi: ekranda gördüğün tarihi GG.AA.YYYY SS:DD:SS formatına çevir
+- Bulamadıklarını null yaz
+- SADECE JSON döndür, başka hiçbir şey yazma
 
-Emir tipi: Ekranda tam olarak ne yazıyorsa yaz ("Limit Alış", "Market Satış", "Kolay Alış" vb.)
-
-Tarih formatı: Ekranda ne yazıyorsa yaz, sonra GG.AA.YYYY SS:DD:SS olarak normalize et.
-
-Yanıt formatı — sadece bu JSON, başka hiçbir şey:
 {
   "platform": null,
   "islem_cifti": null,
@@ -137,24 +129,25 @@ def extract_trade_data(image_bytes: bytes) -> dict:
     media_type = _detect_image_type(image_bytes)
     b64 = base64.standard_b64encode(image_bytes).decode()
 
-    def _call():
-        return claude.messages.create(
+    for attempt in range(3):
+        # 2. ve 3. denemede modele "sadece JSON" diye daha sert hatırlat
+        extra = "" if attempt == 0 else "\n\nSADECE JSON döndür. Hiçbir açıklama ekleme."
+        msg = claude.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=4096,
+            max_tokens=1024,
             system=EXTRACT_SYSTEM,
             messages=[{
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-                    {"type": "text", "text": EXTRACT_PROMPT},
+                    {"type": "text", "text": EXTRACT_PROMPT + extra},
                 ],
             }],
         )
-
-    for attempt in range(3):
-        msg = _call()
         raw = msg.content[0].text.strip()
+        # Markdown kod bloğu varsa temizle
         raw = raw.replace("```json", "").replace("```", "").strip()
+        # JSON nesnesini bul
         start = raw.find("{")
         end   = raw.rfind("}") + 1
         if start != -1 and end > start:
@@ -162,9 +155,9 @@ def extract_trade_data(image_bytes: bytes) -> dict:
         try:
             return json.loads(raw)
         except json.JSONDecodeError as e:
-            log.warning(f"JSON parse hatası (deneme {attempt+1}/3): {e}\nHam: {raw[:200]}")
+            log.warning(f"JSON parse hatası (deneme {attempt+1}/3): {e}\nHam: {raw[:300]}")
             if attempt == 2:
-                raise ValueError(f"Claude 3 denemede geçerli JSON döndürmedi: {e}") from e
+                raise ValueError(f"Görüntü 3 denemede okunamadı. Lütfen daha net bir ekran görüntüsü gönderin.") from e
             continue
 
 def get_or_create_islem_ws(sh):
@@ -379,8 +372,12 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _pending_counts[user_id] = _pending_counts.get(user_id, 0) + 1
     _last_chat_id[user_id] = update.effective_chat.id
 
-    photo     = await update.message.photo[-1].get_file()
-    img_bytes = await photo.download_as_bytearray()
+    # En yüksek çözünürlüklü versiyonu al ve doğrudan URL'den indir
+    tg_file   = await update.message.photo[-1].get_file()
+    img_bytes = await tg_file.download_as_bytearray()
+    # Boş gelirse hata ver
+    if not img_bytes:
+        raise ValueError("Fotoğraf boş geldi, tekrar gönderin.")
 
     try:
         data = extract_trade_data(bytes(img_bytes))
