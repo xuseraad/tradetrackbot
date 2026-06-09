@@ -100,9 +100,17 @@ def get_currency_label(para_birimi: str) -> str:
     return "TL" if (para_birimi or "").upper() == "TL" else "USDT"
 
 def split_datetime(raw: str) -> tuple[str, str]:
+    import re
+    # "9 Haziran 2026 04:26:49 -> 09.06.2026 04:26:49" gibi ok iceren formati coz
+    if chr(8594) in raw:
+        raw = raw.split(chr(8594))[-1].strip()
     if "," in raw:
         t, s = [x.strip() for x in raw.split(",", 1)]
         return t, s
+    # "GG.AA.YYYY SS:DD:SS" formatini yakala
+    m = re.match(r"(\d{1,2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2}:\d{2})", raw.strip())
+    if m:
+        return m.group(1), m.group(2)
     if " " in raw.strip():
         parts = raw.strip().split(" ", 1)
         return parts[0], parts[1]
@@ -359,6 +367,7 @@ async def cmd_eslestir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Her chat için aktif bir zamanlayıcı görevini ve sayaç durumunu tutar
 _user_tasks = {}
 _pending_counts = {}
+_last_chat_id = {}   # user_id -> chat_id  (albüm sorununu çözmek için)
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -366,9 +375,10 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Erişim izniniz yok.")
         return
 
-    # Bekleyen işlem sayısını artır
+    # Bekleyen işlem sayısını artır ve son chat_id'yi sakla
     _pending_counts[user_id] = _pending_counts.get(user_id, 0) + 1
-    
+    _last_chat_id[user_id] = update.effective_chat.id
+
     photo     = await update.message.photo[-1].get_file()
     img_bytes = await photo.download_as_bytearray()
 
@@ -390,22 +400,26 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _user_tasks[user_id].cancel()
 
     # Yeni bir geri sayım görevi başlat (5 saniye hareketsizlik bekle)
-    _user_tasks[user_id] = asyncio.create_task(trigger_delayed_sync(update, ctx, user_id))
+    # update yerine bot + chat_id geçiriyoruz; albüm mesajlarında update.message stale olabilir
+    _user_tasks[user_id] = asyncio.create_task(
+        trigger_delayed_sync(ctx.bot, _last_chat_id[user_id], user_id)
+    )
 
-async def trigger_delayed_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_id: str):
+async def trigger_delayed_sync(bot, chat_id: int, user_id: str):
     try:
         await asyncio.sleep(5.0)
 
         count = _pending_counts.get(user_id, 1)
-        await update.message.reply_text(f"şimdi {count} adet fotoğraf algılandı, arka planda otomatik sıralanıp eşleştiriliyor... ⏳")
+        await bot.send_message(chat_id, f"şimdi {count} adet fotoğraf algılandı, arka planda otomatik sıralanıp eşleştiriliyor... ⏳")
 
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, jorik_sirala)
         await loop.run_in_executor(None, jorik_eslestir)
 
-        await update.message.reply_text("✅ Gönderdiğiniz tüm fotoğraflar başarıyla kronolojik sıraya dizildi ve Kar-Zarar tablonuz sıfırdan kusursuzca eşleştirildi! 🎯")
+        await bot.send_message(chat_id, "✅ Gönderdiğiniz tüm fotoğraflar başarıyla kronolojik sıraya dizildi ve Kar-Zarar tablonuz sıfırdan kusursuzca eşleştirildi! 🎯")
         _pending_counts.pop(user_id, None)
-        
+        _last_chat_id.pop(user_id, None)
+
     except asyncio.CancelledError:
         # Görev iptal edildiyse sorun yok, yeni fotoğraf süreyi sıfırladı demektir
         pass
@@ -414,6 +428,7 @@ async def trigger_delayed_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE, u
         if user_id in _user_tasks and _user_tasks[user_id] == asyncio.current_task():
             _user_tasks.pop(user_id, None)
             _pending_counts.pop(user_id, None)
+            _last_chat_id.pop(user_id, None)
 
 # ─── Diğer Standart Komutlar ve Yapı ─────────────────────────────────────────
 async def cmd_acik(update, ctx):
